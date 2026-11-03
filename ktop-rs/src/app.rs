@@ -19,7 +19,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufWriter, Stdout, Write};
 use std::time::{Duration, Instant};
 
-use sysinfo::{CpuRefreshKind, MemoryRefreshKind, Networks, RefreshKind, System};
+use sysinfo::{CpuRefreshKind, Networks, RefreshKind, System};
 
 const HISTORY_LEN: usize = 300;
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(250);
@@ -268,11 +268,9 @@ pub fn run(
     no_sync: bool,
     compat: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Init system
+    // Init system (CPU only — memory comes from a direct /proc/meminfo read)
     let mut sys = System::new_with_specifics(
-        RefreshKind::nothing()
-            .with_cpu(CpuRefreshKind::nothing().with_cpu_usage())
-            .with_memory(MemoryRefreshKind::everything()),
+        RefreshKind::nothing().with_cpu(CpuRefreshKind::nothing().with_cpu_usage()),
     );
     let mut networks = Networks::new_with_refreshed_list();
 
@@ -314,7 +312,7 @@ pub fn run(
     let theme_cursor = names.iter().position(|&n| n == theme_name).unwrap_or(0);
 
     // Init other subsystems
-    let mut net_tracker = NetTracker::new(&sys);
+    let mut net_tracker = NetTracker::new();
     let mut disk_tracker = system::DiskTracker::new();
     let mut proc_scanner = ProcScanner::new();
     let mut oom_tracker = OomTracker::new(sim);
@@ -407,19 +405,30 @@ pub fn run(
         loop {
             let now = Instant::now();
 
-            // Handle events with ~50ms poll timeout
-            if event::poll(Duration::from_millis(50))? {
+            // Wake exactly when there is work: the next refresh tick, or —
+            // while a resize is debouncing — when the debounce can settle.
+            // Key/resize events wake the poll immediately regardless.
+            let mut wait = refresh_dur.saturating_sub(now.duration_since(last_refresh));
+            if let Some((_, since)) = pending_resize {
+                let debounce_left = RESIZE_DEBOUNCE.saturating_sub(now.duration_since(since));
+                if debounce_left < wait {
+                    wait = debounce_left;
+                }
+            }
+            if event::poll(wait)? {
                 match event::read()? {
                     Event::Key(key) => {
                         let color_mode_before = state.color_mode;
-                        if handle_key(key, &mut state) {
+                        let (quit, changed) = handle_key(key, &mut state);
+                        if quit {
                             break;
                         }
                         if state.color_mode != color_mode_before {
                             reset_and_clear_terminal(&mut terminal)?;
                         }
-                        // Immediate redraw on keypress
-                        if pending_resize.is_none() {
+                        // Immediate redraw when the key changed something;
+                        // unhandled keys leave the screen untouched.
+                        if changed && pending_resize.is_none() {
                             draw_app(&mut terminal, &state, !no_sync)?;
                         }
                         continue;
@@ -477,30 +486,34 @@ pub fn run(
                         system::read_cpu_freq().unwrap_or_else(|| state.cpu_freq.clone());
                 }
 
-                // Memory
-                sys.refresh_memory();
-                state.ram_total = sys.total_memory();
-                state.ram_used = sys.used_memory();
-                state.ram_pct = if state.ram_total > 0 {
-                    state.ram_used as f64 / state.ram_total as f64 * 100.0
-                } else {
-                    0.0
-                };
-                let (avail, cached) = system::read_available_cached();
-                state.ram_available = avail;
-                state.ram_cached = cached;
-                state.swap_total = sys.total_swap();
-                state.swap_used = sys.used_swap();
-                state.swap_pct = if state.swap_total > 0 {
-                    state.swap_used as f64 / state.swap_total as f64 * 100.0
-                } else {
-                    0.0
-                };
+                // Memory — one /proc/meminfo read feeds every field the
+                // panel shows; used/swap_used are the same differences
+                // sysinfo computed (total − available, total − free). On a
+                // read failure the previous values stay, like sysinfo's
+                // stale fields did.
+                if let Some(m) = system::read_mem_sample() {
+                    state.ram_total = m.total;
+                    state.ram_available = m.available;
+                    state.ram_cached = m.cached;
+                    state.ram_used = state.ram_total.saturating_sub(state.ram_available);
+                    state.ram_pct = if state.ram_total > 0 {
+                        state.ram_used as f64 / state.ram_total as f64 * 100.0
+                    } else {
+                        0.0
+                    };
+                    state.swap_total = m.swap_total;
+                    state.swap_used = m.swap_total.saturating_sub(m.swap_free);
+                    state.swap_pct = if state.swap_total > 0 {
+                        state.swap_used as f64 / state.swap_total as f64 * 100.0
+                    } else {
+                        0.0
+                    };
+                    state.mem_committed = m.committed;
+                }
                 let (swap_r, swap_w) = swap_tracker.sample();
                 state.swap_io_read = swap_r;
                 state.swap_io_write = swap_w;
                 state.mem_psi_some = system::read_mem_psi_some();
-                state.mem_committed = system::read_committed_limit();
 
                 // GPUs
                 let mut gpu_infos = Vec::new();
@@ -581,8 +594,8 @@ pub fn run(
                     None
                 };
 
-                // CPU temps via sysinfo
-                sample_temps(&sys, &mut state);
+                // CPU/mem temps via the hwmon table
+                sample_temps(&mut state);
 
                 // Network
                 networks.refresh(true);
@@ -610,9 +623,12 @@ pub fn run(
                 } else {
                     PROCESS_SCAN_SECS
                 };
-                proc_scanner.scan(state.ram_total, proc_scan_secs);
-                state.procs_by_mem = proc_scanner.by_mem.clone();
-                state.procs_by_cpu = proc_scanner.by_cpu.clone();
+                if proc_scanner.scan(state.ram_total, proc_scan_secs) {
+                    // Hand the freshly built tables to the state without
+                    // copying; the scanner never reads them back between builds.
+                    std::mem::swap(&mut state.procs_by_mem, &mut proc_scanner.by_mem);
+                    std::mem::swap(&mut state.procs_by_cpu, &mut proc_scanner.by_cpu);
+                }
 
                 // OOM
                 oom_tracker.check();
@@ -736,7 +752,10 @@ fn restore_terminal(
     Ok(())
 }
 
-fn handle_key(key: KeyEvent, state: &mut AppState) -> bool {
+/// Returns `(quit, redraw)`: whether the app should exit, and whether the
+/// key changed any state the UI shows. Unhandled keys report `false` so
+/// no-op keypresses skip the full redraw.
+fn handle_key(key: KeyEvent, state: &mut AppState) -> (bool, bool) {
     let names = theme::theme_names();
     let total = names.len();
     let cols = 3;
@@ -767,15 +786,17 @@ fn handle_key(key: KeyEvent, state: &mut AppState) -> bool {
             KeyCode::Right => {
                 state.theme_cursor = (state.theme_cursor + 1).min(total - 1);
             }
-            _ => {}
+            _ => return (false, false),
         }
-        return false;
+        return (false, true);
     }
 
     match key.code {
-        KeyCode::Char('q') | KeyCode::Char('Q') => return true,
-        KeyCode::Esc => return true,
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
+        KeyCode::Char('q') | KeyCode::Char('Q') => return (true, false),
+        KeyCode::Esc => return (true, false),
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            return (true, false)
+        }
         KeyCode::Char('t') | KeyCode::Char('T') => {
             state.picking_theme = true;
             state.theme_cursor = names
@@ -790,82 +811,64 @@ fn handle_key(key: KeyEvent, state: &mut AppState) -> bool {
                 color_mode: Some(state.color_mode),
             });
         }
-        _ => {}
+        _ => return (false, false),
     }
-    false
+    (false, true)
 }
 
-fn sample_temps(_sys: &System, state: &mut AppState) {
-    // Read from sysfs directly for CPU and memory temps
+fn sample_temps(state: &mut AppState) {
+    // Read only the sensor files the cached hwmon table resolved to exist
+    // (values are re-read every tick; see system::hwmon_table)
     state.cpu_temp = None;
     state.cpu_temp_max = 100.0;
     state.mem_temp = None;
     state.mem_temp_max = 85.0;
 
-    if let Ok(entries) = std::fs::read_dir("/sys/class/hwmon") {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name = std::fs::read_to_string(path.join("name"))
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-
-            // CPU temps
-            if matches!(
-                name.as_str(),
-                "coretemp" | "k10temp" | "cpu_thermal" | "zenpower" | "acpitz"
-            ) {
-                for i in 1..=16 {
-                    let temp_path = path.join(format!("temp{}_input", i));
-                    if let Ok(val) = std::fs::read_to_string(&temp_path) {
-                        if let Ok(millideg) = val.trim().parse::<f64>() {
-                            let temp = millideg / 1000.0;
-                            state.cpu_temp =
-                                Some(state.cpu_temp.map(|t: f64| t.max(temp)).unwrap_or(temp));
-                        }
-                    }
-                    // Check critical then high temp
-                    let crit_path = path.join(format!("temp{}_crit", i));
-                    if let Ok(val) = std::fs::read_to_string(&crit_path) {
-                        if let Ok(millideg) = val.trim().parse::<f64>() {
-                            let crit = millideg / 1000.0;
-                            if crit > state.cpu_temp_max {
-                                state.cpu_temp_max = crit;
-                            }
-                        }
-                    } else {
-                        let high_path = path.join(format!("temp{}_max", i));
-                        if let Ok(val) = std::fs::read_to_string(&high_path) {
-                            if let Ok(millideg) = val.trim().parse::<f64>() {
-                                let high = millideg / 1000.0;
-                                if high > state.cpu_temp_max {
-                                    state.cpu_temp_max = high;
-                                }
-                            }
-                        }
-                    }
+    for dev in system::hwmon_table().iter() {
+        // CPU temps
+        if matches!(
+            dev.name.as_str(),
+            "coretemp" | "k10temp" | "cpu_thermal" | "zenpower" | "acpitz"
+        ) {
+            for input in &dev.temp_inputs {
+                if let Some(temp) = read_hwmon_millideg(input) {
+                    state.cpu_temp =
+                        Some(state.cpu_temp.map(|t: f64| t.max(temp)).unwrap_or(temp));
                 }
             }
-
-            // Memory temps (SODIMM, dimm, memory)
-            if name == "SODIMM" || name == "dimm" || name == "memory" {
-                for i in 1..=4 {
-                    let temp_path = path.join(format!("temp{}_input", i));
-                    if let Ok(val) = std::fs::read_to_string(&temp_path) {
-                        if let Ok(millideg) = val.trim().parse::<f64>() {
-                            let temp = millideg / 1000.0;
-                            state.mem_temp =
-                                Some(state.mem_temp.map(|t: f64| t.max(temp)).unwrap_or(temp));
-                        }
+            for (crit, high) in &dev.temp_limits {
+                // crit wins when present; _max only when the crit file is absent
+                if let Some(val) = crit.as_ref().and_then(|p| read_hwmon_millideg(p)) {
+                    if val > state.cpu_temp_max {
+                        state.cpu_temp_max = val;
                     }
-                    let crit_path = path.join(format!("temp{}_crit", i));
-                    if let Ok(val) = std::fs::read_to_string(&crit_path) {
-                        if let Ok(millideg) = val.trim().parse::<f64>() {
-                            state.mem_temp_max = millideg / 1000.0;
-                        }
+                } else if let Some(val) = high.as_ref().and_then(|p| read_hwmon_millideg(p)) {
+                    if val > state.cpu_temp_max {
+                        state.cpu_temp_max = val;
                     }
                 }
             }
         }
+
+        // Memory temps (SODIMM, dimm, memory)
+        if matches!(dev.name.as_str(), "SODIMM" | "dimm" | "memory") {
+            for input in dev.temp_inputs.iter().take(4) {
+                if let Some(temp) = read_hwmon_millideg(input) {
+                    state.mem_temp =
+                        Some(state.mem_temp.map(|t: f64| t.max(temp)).unwrap_or(temp));
+                }
+            }
+            for crit in dev.temp_limits.iter().take(4).filter_map(|(crit, _)| crit.as_ref()) {
+                if let Some(val) = read_hwmon_millideg(crit) {
+                    state.mem_temp_max = val;
+                }
+            }
+        }
     }
+}
+
+fn read_hwmon_millideg(path: &std::path::Path) -> Option<f64> {
+    let val = std::fs::read_to_string(path).ok()?;
+    let millideg = val.trim().parse::<f64>().ok()?;
+    Some(millideg / 1000.0)
 }

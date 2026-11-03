@@ -22,18 +22,18 @@ const SPARK_DOWN: &[char] = &[
 
 // ── Sparkline helpers ──
 
-fn sparkline(values: &VecDeque<f64>, width: usize) -> String {
-    if values.is_empty() {
-        return String::new();
-    }
-    let vals: Vec<f64> = if values.len() > width {
-        values.iter().skip(values.len() - width).copied().collect()
-    } else {
-        values.iter().copied().collect()
-    };
+// `scale` maps raw values (e.g. bytes/s, watts) onto the 0..100 range the
+// glyph tables expect: v/scale*100 clamped. None passes percentage values
+// through unchanged. Callers avoid building a renormalized copy per frame.
+
+fn sparkline(values: &VecDeque<f64>, width: usize, scale: Option<f64>) -> String {
     let mut out = String::new();
-    for v in &vals {
-        let v = v.clamp(0.0, 100.0);
+    for v in values.iter().skip(values.len().saturating_sub(width)) {
+        let v = match scale {
+            Some(mx) => (v / mx * 100.0).clamp(0.0, 100.0),
+            None => *v,
+        }
+        .clamp(0.0, 100.0);
         let idx = if v <= 5.0 {
             0
         } else {
@@ -46,18 +46,10 @@ fn sparkline(values: &VecDeque<f64>, width: usize) -> String {
 }
 
 fn sparkline_double(values: &VecDeque<f64>, width: usize) -> (String, String) {
-    if values.is_empty() {
-        return (String::new(), String::new());
-    }
-    let vals: Vec<f64> = if values.len() > width {
-        values.iter().skip(values.len() - width).copied().collect()
-    } else {
-        values.iter().copied().collect()
-    };
     let n = SPARK.len() - 1; // 8 levels per row
     let mut top = String::new();
     let mut bot = String::new();
-    for v in &vals {
+    for v in values.iter().skip(values.len().saturating_sub(width)) {
         let v = v.clamp(0.0, 100.0);
         let level = ((v / 100.0) * (2 * n) as f64) as usize;
         let level = level.min(2 * n);
@@ -72,18 +64,14 @@ fn sparkline_double(values: &VecDeque<f64>, width: usize) -> (String, String) {
     (top, bot)
 }
 
-fn sparkline_down(values: &VecDeque<f64>, width: usize) -> String {
-    if values.is_empty() {
-        return String::new();
-    }
-    let vals: Vec<f64> = if values.len() > width {
-        values.iter().skip(values.len() - width).copied().collect()
-    } else {
-        values.iter().copied().collect()
-    };
+fn sparkline_down(values: &VecDeque<f64>, width: usize, scale: Option<f64>) -> String {
     let mut out = String::new();
-    for v in &vals {
-        let v = v.clamp(0.0, 100.0);
+    for v in values.iter().skip(values.len().saturating_sub(width)) {
+        let v = match scale {
+            Some(mx) => (v / mx * 100.0).clamp(0.0, 100.0),
+            None => *v,
+        }
+        .clamp(0.0, 100.0);
         let idx = (v / 100.0 * (SPARK_DOWN.len() as f64 - 1.0)) as usize;
         out.push(SPARK_DOWN[idx.min(SPARK_DOWN.len() - 1)]);
     }
@@ -535,7 +523,7 @@ fn render_gpu(f: &mut Frame, area: Rect, state: &AppState) {
             state
                 .gpu_util_hist
                 .get(&g.id)
-                .map(|h| sparkline(h, spark_w))
+                .map(|h| sparkline(h, spark_w, None))
                 .unwrap_or_default()
         };
         let spark_m = if state.steady_render {
@@ -544,7 +532,7 @@ fn render_gpu(f: &mut Frame, area: Rect, state: &AppState) {
             state
                 .gpu_mem_hist
                 .get(&g.id)
-                .map(|h| sparkline(h, spark_w))
+                .map(|h| sparkline(h, spark_w, None))
                 .unwrap_or_default()
         };
 
@@ -670,13 +658,7 @@ fn render_gpu(f: &mut Frame, area: Rect, state: &AppState) {
                 String::new()
             } else {
                 phist
-                    .map(|h| {
-                        let pct: std::collections::VecDeque<f64> = h
-                            .iter()
-                            .map(|w| (w / pscale * 100.0).clamp(0.0, 100.0))
-                            .collect();
-                        sparkline(&pct, spark_w)
-                    })
+                    .map(|h| sparkline(h, spark_w, Some(pscale)))
                     .unwrap_or_default()
             };
             lines.push(Line::from(Span::styled(
@@ -910,19 +892,9 @@ fn render_net(f: &mut Frame, area: Rect, state: &AppState) {
     let (spark_up_str, spark_dn_str) = if state.steady_render {
         (String::new(), String::new())
     } else {
-        let up_hist_pct: VecDeque<f64> = state
-            .net_up_hist
-            .iter()
-            .map(|v| (v / mx * 100.0).min(100.0))
-            .collect();
-        let down_hist_pct: VecDeque<f64> = state
-            .net_down_hist
-            .iter()
-            .map(|v| (v / mx * 100.0).min(100.0))
-            .collect();
         (
-            sparkline(&up_hist_pct, spark_w),
-            sparkline_down(&down_hist_pct, spark_w),
+            sparkline(&state.net_up_hist, spark_w, Some(mx)),
+            sparkline_down(&state.net_down_hist, spark_w, Some(mx)),
         )
     };
 

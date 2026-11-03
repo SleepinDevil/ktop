@@ -52,6 +52,15 @@ fn normalize_bdf(bus_id: &str) -> String {
 }
 
 // Live PCIe link state from sysfs (works for every vendor, no root).
+// The negotiated current link is volatile and read fresh; the max_link_*
+// capability pair is static while the device is bound, so it is resolved
+// on first use and cached per BDF. A GPU can be swapped at runtime — but
+// GPU discovery itself is startup-only here, so the cache is consistent
+// with the rest of the app.
+static PCI_MAX_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<String, (String, u32)>>,
+> = std::sync::LazyLock::new(Default::default);
+
 fn read_pci_link(bdf: &str) -> Option<PciLink> {
     if bdf.is_empty() {
         return None;
@@ -66,15 +75,28 @@ fn read_pci_link(bdf: &str) -> Option<PciLink> {
         .trim()
         .parse()
         .ok()?;
-    let max_speed = fs::read_to_string(format!("{}/max_link_speed", base))
-        .ok()?
-        .trim()
-        .to_string();
-    let max_width = fs::read_to_string(format!("{}/max_link_width", base))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
+    let cached = PCI_MAX_CACHE
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(bdf).cloned());
+    let (max_speed, max_width) = match cached {
+        Some(v) => v,
+        None => {
+            let max_speed = fs::read_to_string(format!("{}/max_link_speed", base))
+                .ok()?
+                .trim()
+                .to_string();
+            let max_width = fs::read_to_string(format!("{}/max_link_width", base))
+                .ok()?
+                .trim()
+                .parse()
+                .ok()?;
+            if let Ok(mut cache) = PCI_MAX_CACHE.lock() {
+                cache.insert(bdf.to_string(), (max_speed.clone(), max_width));
+            }
+            (max_speed, max_width)
+        }
+    };
     Some(PciLink {
         cur_speed,
         cur_width,
@@ -113,6 +135,28 @@ fn topmost_bridge_bdf(bdf: &str) -> Option<String> {
     }
     let path = fs::canonicalize(format!("/sys/bus/pci/devices/{}", bdf)).ok()?;
     topmost_bridge_in(&path)
+}
+
+// hwmon power-cap attributes are a set-point, not a sensor: they change
+// only when someone writes them. Resolve on first read and keep; failures
+// are not cached, so a device that never exposes a cap keeps the original
+// per-tick behavior (a None path costs nothing either way).
+fn cached_power_limit(
+    cache: &std::cell::Cell<Option<Option<f64>>>,
+    path: &Option<PathBuf>,
+) -> Option<f64> {
+    if let Some(v) = cache.get() {
+        return v;
+    }
+    let v = path
+        .as_ref()
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .map(|v| v / 1_000_000.0);
+    if v.is_some() {
+        cache.set(Some(v));
+    }
+    v
 }
 
 // ── NVIDIA via NVML ──
@@ -243,6 +287,7 @@ pub struct AmdCard {
     pub power_cap_path: Option<PathBuf>,
     pub power_scale: f64,
     pub bdf: String,
+    power_limit_cache: std::cell::Cell<Option<Option<f64>>>,
 }
 
 pub fn detect_amd_gpus() -> Vec<AmdCard> {
@@ -355,6 +400,7 @@ pub fn detect_amd_gpus() -> Vec<AmdCard> {
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default(),
             power_cap_path,
+            power_limit_cache: std::cell::Cell::new(None),
         });
     }
     cards
@@ -397,12 +443,7 @@ impl AmdCard {
             mem_pct,
             has_mem: true,
             pci: read_pci_link(&self.bdf),
-            power_limit_w: self
-                .power_cap_path
-                .as_ref()
-                .and_then(|p| fs::read_to_string(p).ok())
-                .and_then(|v| v.trim().parse::<f64>().ok())
-                .map(|v| v / 1_000_000.0),
+            power_limit_w: cached_power_limit(&self.power_limit_cache, &self.power_cap_path),
             pcie_rx_kbs: None,
             pcie_tx_kbs: None,
         }
@@ -460,6 +501,7 @@ pub struct IntelCard {
     driver: String,
     l0: Option<L0>,
     fd_prev: HashMap<String, (f64, u64)>,
+    power_limit_cache: std::cell::Cell<Option<Option<f64>>>,
 }
 
 pub fn detect_intel_gpus() -> Vec<IntelCard> {
@@ -1061,6 +1103,7 @@ fn detect_intel_gpus_in(sys_root: &std::path::Path, l0_enabled: bool) -> Vec<Int
             driver,
             l0,
             fd_prev: HashMap::new(),
+            power_limit_cache: std::cell::Cell::new(None),
         });
     }
     cards
@@ -1069,18 +1112,32 @@ fn detect_intel_gpus_in(sys_root: &std::path::Path, l0_enabled: bool) -> Vec<Int
 impl IntelCard {
     pub fn sample(&mut self, id: usize) -> GpuInfo {
         let pmu_util = self.util_pct();
-        let (fd_util, fd_vram) = fdinfo_scan(
-            std::path::Path::new("/proc"),
-            &self.driver,
-            &self.bdf,
-            &mut self.fd_prev,
-        );
-        let util = pmu_util.or(fd_util);
         let l0_mem = self.l0.as_ref().and_then(|l| l.mem_used_total());
+        let sysfs_vram = self
+            .vram_used_path
+            .as_ref()
+            .and_then(|p| read_u64(p))
+            .filter(|_| l0_mem.is_none());
+        // The fdinfo walk touches every /proc/<pid>/fdinfo on the box, so it
+        // runs only when its answers are actually needed: utilization when
+        // the PMU is unavailable, and VRAM when neither Level Zero nor sysfs
+        // exposes it. With both covered the scan result would be discarded.
+        let (fd_util, fd_vram) = if pmu_util.is_some() && (l0_mem.is_some() || sysfs_vram.is_some())
+        {
+            (None, None)
+        } else {
+            fdinfo_scan(
+                std::path::Path::new("/proc"),
+                &self.driver,
+                &self.bdf,
+                &mut self.fd_prev,
+            )
+        };
+        let util = pmu_util.or(fd_util);
         let mem_used_bytes: Option<u64> = l0_mem
             .map(|(u, _)| u)
-            .or(fd_vram)
-            .or_else(|| self.vram_used_path.as_ref().and_then(|p| read_u64(p)));
+            .or(sysfs_vram)
+            .or(fd_vram);
         let mem_total_bytes = l0_mem
             .map(|(_, t)| t)
             .filter(|t| *t > 0)
@@ -1103,12 +1160,7 @@ impl IntelCard {
             mem_total_gb: mem_total / (1024.0 * 1024.0 * 1024.0),
             mem_pct,
             pci: read_pci_link(&self.link_bdf),
-            power_limit_w: self
-                .power_cap_path
-                .as_ref()
-                .and_then(|p| fs::read_to_string(p).ok())
-                .and_then(|v| v.trim().parse::<f64>().ok())
-                .map(|v| v / 1_000_000.0),
+            power_limit_w: cached_power_limit(&self.power_limit_cache, &self.power_cap_path),
             pcie_rx_kbs: None,
             pcie_tx_kbs: None,
         }

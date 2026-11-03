@@ -5,8 +5,6 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Instant;
 
-use sysinfo::System;
-
 // ── Process info (read from /proc directly for efficiency) ──
 
 #[derive(Clone, Debug)]
@@ -19,8 +17,25 @@ pub struct ProcInfo {
     pub shared: u64,
 }
 
-/// How many rows each Top Processes list holds (sort-then-truncate cap).
+/// How many rows each Top Processes lists hold (sort-then-truncate cap).
 const MAX_PROCS: usize = 20;
+
+/// Read buffer for /proc/<pid>/stat. The kernel's stat line is bounded
+/// well below this (~500 bytes with a 128-CPU affinity mask and a 15-byte
+/// comm), so one pass of File::read is complete; a truncated parse simply
+/// fails like the original read error did.
+const STAT_BUF: usize = 1024;
+
+/// One process as the sampling pass sees it: everything needed to rank,
+/// without any heap allocation. Name and shared memory are only fetched
+/// for rows that survive truncation into the displayed tables.
+#[derive(Clone, Copy)]
+struct RawProc {
+    pid: u32,
+    rss: u64,
+    cpu_pct: f64,
+    mem_pct: f64,
+}
 
 pub struct ProcScanner {
     cpu_prev: HashMap<u32, u64>,
@@ -69,7 +84,10 @@ impl ProcScanner {
         }
     }
 
-    pub fn scan(&mut self, total_mem: u64, min_wait_secs: f64) {
+    /// Rebuilds the top-process tables. Returns whether this call actually
+    /// rebuilt (calls inside the `min_wait_secs` window are no-ops), so the
+    /// caller only hands freshly built tables to the display state.
+    pub fn scan(&mut self, total_mem: u64, min_wait_secs: f64) -> bool {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_scan).as_secs_f64();
         let min_wait = if self.by_mem.is_empty() {
@@ -78,15 +96,20 @@ impl ProcScanner {
             min_wait_secs.max(1.0)
         };
         if elapsed < min_wait {
-            return;
+            return false;
         }
         let dt = elapsed;
         self.last_scan = now;
 
         let ps = self.page_size;
         let ct = self.clock_ticks as f64;
-        let mut procs = Vec::new();
 
+        // Compact pass: every live pid yields one RawProc — no per-process
+        // path formatting, String allocation, or field-vector allocation.
+        // The expensive display fields (name, shared) are only materialized
+        // for the ≤2×MAX_PROCS rows actually rendered.
+        let mut raw: Vec<RawProc> = Vec::with_capacity(256);
+        let mut buf = [0u8; STAT_BUF];
         if let Ok(entries) = fs::read_dir("/proc") {
             for entry in entries.flatten() {
                 let name = entry.file_name();
@@ -95,40 +118,13 @@ impl ProcScanner {
                     Ok(p) if p > 0 => p,
                     _ => continue,
                 };
-
-                let stat_path = format!("/proc/{}/stat", pid);
-                let stat = match read_file_bytes(&stat_path) {
+                let stat = match read_proc_stat(pid, &mut buf) {
                     Some(s) => s,
                     None => continue,
                 };
-
-                // Parse stat: find last ')' for comm field
-                let rparen = match stat.iter().rposition(|&b| b == b')') {
-                    Some(i) => i,
+                let (utime, stime, rss_pages) = match parse_stat_usage(stat) {
+                    Some(v) => v,
                     None => continue,
-                };
-
-                let fields_bytes = &stat[rparen + 2..];
-                let fields: Vec<&[u8]> = fields_bytes.splitn(23, |&b| b == b' ').collect();
-                if fields.len() < 22 {
-                    continue;
-                }
-
-                let utime = parse_u64(fields[11]);
-                let stime = parse_u64(fields[12]);
-                let rss = parse_u64(fields[21]) * ps;
-
-                // Extract name
-                let lparen = stat.iter().position(|&b| b == b'(').unwrap_or(0);
-                let proc_name = String::from_utf8_lossy(&stat[lparen + 1..rparen])
-                    .chars()
-                    .take(28)
-                    .collect::<String>();
-
-                let mem_pct = if total_mem > 0 {
-                    rss as f64 / total_mem as f64 * 100.0
-                } else {
-                    0.0
                 };
 
                 let cpu_total = utime + stime;
@@ -145,58 +141,78 @@ impl ProcScanner {
                 let cpu_pct = previous_smoothed * 0.65 + raw_cpu_pct * 0.35;
                 self.cpu_smoothed.insert(pid, cpu_pct);
 
-                procs.push(ProcInfo {
+                let mem_pct = if total_mem > 0 {
+                    (rss_pages * ps) as f64 / total_mem as f64 * 100.0
+                } else {
+                    0.0
+                };
+                raw.push(RawProc {
                     pid,
-                    name: proc_name,
-                    cpu_percent: cpu_pct,
-                    memory_percent: mem_pct,
-                    rss,
-                    shared: 0,
+                    rss: rss_pages * ps,
+                    cpu_pct,
+                    mem_pct,
                 });
             }
         }
 
-        // Sort and take the top `MAX_PROCS` by each metric
-        let mut by_mem = procs.clone();
-        by_mem.sort_by(|a, b| {
-            b.memory_percent
-                .partial_cmp(&a.memory_percent)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.pid.cmp(&b.pid))
-        });
-        by_mem.truncate(MAX_PROCS);
-
-        let mut by_cpu = procs.clone();
-        by_cpu.sort_by(|a, b| {
-            b.cpu_percent
-                .partial_cmp(&a.cpu_percent)
+        // Sort and take the top `MAX_PROCS` by each metric. One vector,
+        // two in-place sorts: the comparators are total orders (pid breaks
+        // every tie) and stable, so results are identical to the previous
+        // clone-sort-truncate. The top-20 copies are taken before the
+        // second sort reorders the vector.
+        raw.sort_by(|a, b| {
+            b.cpu_pct
+                .partial_cmp(&a.cpu_pct)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| {
-                    b.memory_percent
-                        .partial_cmp(&a.memory_percent)
+                    b.mem_pct
+                        .partial_cmp(&a.mem_pct)
                         .unwrap_or(std::cmp::Ordering::Equal)
                 })
                 .then_with(|| a.pid.cmp(&b.pid))
         });
-        by_cpu.truncate(MAX_PROCS);
+        let cpu_top: Vec<RawProc> = raw.iter().copied().take(MAX_PROCS).collect();
+        raw.sort_by(|a, b| {
+            b.mem_pct
+                .partial_cmp(&a.mem_pct)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.pid.cmp(&b.pid))
+        });
+        let mem_top: Vec<RawProc> = raw.iter().copied().take(MAX_PROCS).collect();
 
-        // Read shared memory for displayed procs
-        let displayed: std::collections::HashSet<u32> =
-            by_mem.iter().chain(by_cpu.iter()).map(|p| p.pid).collect();
-
-        for p in by_mem.iter_mut().chain(by_cpu.iter_mut()) {
-            if displayed.contains(&p.pid) {
-                p.shared = read_proc_shared(p.pid, self.page_size);
-            }
+        // Read name and shared memory for displayed procs (the union of
+        // the two lists; every entry of a list is displayed)
+        let mut details: HashMap<u32, (String, u64)> = HashMap::new();
+        for r in cpu_top.iter().chain(mem_top.iter()) {
+            details
+                .entry(r.pid)
+                .or_insert_with(|| read_proc_details(r.pid, ps));
         }
+        let take = |r: &RawProc| {
+            let (name, shared) = details
+                .get(&r.pid)
+                .map(|(n, s)| (n.clone(), *s))
+                .unwrap_or_default();
+            ProcInfo {
+                pid: r.pid,
+                name,
+                cpu_percent: r.cpu_pct,
+                memory_percent: r.mem_pct,
+                rss: r.rss,
+                shared,
+            }
+        };
+        let by_cpu: Vec<ProcInfo> = cpu_top.iter().map(take).collect();
+        let by_mem: Vec<ProcInfo> = mem_top.iter().map(take).collect();
 
         // Clean stale PIDs
-        let current: std::collections::HashSet<u32> = procs.iter().map(|p| p.pid).collect();
+        let current: std::collections::HashSet<u32> = raw.iter().map(|p| p.pid).collect();
         self.cpu_prev.retain(|k, _| current.contains(k));
         self.cpu_smoothed.retain(|k, _| current.contains(k));
 
         self.by_mem = by_mem;
         self.by_cpu = by_cpu;
+        true
     }
 
     pub fn num_cpus(&self) -> u64 {
@@ -216,14 +232,96 @@ fn parse_u64(bytes: &[u8]) -> u64 {
     s.parse().unwrap_or(0)
 }
 
-fn read_proc_cpu_total(pid: u32) -> Option<u64> {
-    let stat = read_file_bytes(&format!("/proc/{}/stat", pid))?;
-    let rparen = stat.iter().rposition(|&b| b == b')')?;
-    let fields: Vec<&[u8]> = stat[rparen + 2..].splitn(14, |&b| b == b' ').collect();
-    if fields.len() < 13 {
-        return None;
+/// Read /proc/<pid>/stat into a caller-owned buffer, returning the bytes
+/// actually read (no allocation on the per-process path).
+fn read_proc_stat<'a>(pid: u32, buf: &'a mut [u8; STAT_BUF]) -> Option<&'a [u8]> {
+    // "/proc/" + up to 10 decimal digits + "/stat"
+    let mut path = [0u8; 6 + 10 + 5];
+    path[..6].copy_from_slice(b"/proc/");
+    let mut n = 6;
+    let mut digits = [0u8; 10];
+    let mut d = 0;
+    let mut p = pid;
+    loop {
+        digits[d] = b'0' + (p % 10) as u8;
+        d += 1;
+        p /= 10;
+        if p == 0 {
+            break;
+        }
     }
-    Some(parse_u64(fields[11]) + parse_u64(fields[12]))
+    for i in (0..d).rev() {
+        path[n] = digits[i];
+        n += 1;
+    }
+    path[n..n + 5].copy_from_slice(b"/stat");
+    n += 5;
+    let mut f = fs::File::open(std::str::from_utf8(&path[..n]).ok()?).ok()?;
+    let mut read = 0;
+    while read < buf.len() {
+        match f.read(&mut buf[read..]) {
+            Ok(0) => break,
+            Ok(k) => read += k,
+            Err(_) => return None,
+        }
+    }
+    Some(&buf[..read])
+}
+
+/// Extract (utime, stime, rss_pages) from raw /proc/<pid>/stat bytes —
+/// the three fields the sampler uses, located after the last ')' so a
+/// comm containing spaces or parentheses cannot shift the fields (same
+/// indexing as the previous splitn-based parser, including the ≥22-field
+/// requirement).
+fn parse_stat_usage(stat: &[u8]) -> Option<(u64, u64, u64)> {
+    let rparen = stat.iter().rposition(|&b| b == b')')?;
+    let fields = &stat[rparen + 2..];
+    let mut out = [0u64; 3];
+    let mut complete = false;
+    for (i, t) in fields.split(|&b| b == b' ').enumerate() {
+        match i {
+            11 => out[0] = parse_u64(t),
+            12 => out[1] = parse_u64(t),
+            21 => {
+                out[2] = parse_u64(t);
+                complete = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    complete.then(|| (out[0], out[1], out[2]))
+}
+
+/// The two expensive display fields for one process: comm-based name and
+/// shared memory (RSS-shared from statm). Only called for displayed rows.
+fn read_proc_details(pid: u32, page_size: u64) -> (String, u64) {
+    let mut buf = [0u8; STAT_BUF];
+    let name = match read_proc_stat(pid, &mut buf) {
+        Some(stat) => {
+            let rparen = stat.iter().rposition(|&b| b == b')');
+            match rparen {
+                Some(rp) => {
+                    let lparen = stat.iter().position(|&b| b == b'(').unwrap_or(0);
+                    String::from_utf8_lossy(&stat[lparen + 1..rp])
+                        .chars()
+                        .take(28)
+                        .collect::<String>()
+                }
+                None => String::new(),
+            }
+        }
+        None => String::new(),
+    };
+    let shared = read_proc_shared(pid, page_size);
+    (name, shared)
+}
+
+fn read_proc_cpu_total(pid: u32) -> Option<u64> {
+    let mut buf = [0u8; STAT_BUF];
+    let stat = read_proc_stat(pid, &mut buf)?;
+    let (utime, stime, _) = parse_stat_usage(stat)?;
+    Some(utime + stime)
 }
 
 fn read_proc_shared(pid: u32, page_size: u64) -> u64 {
@@ -286,6 +384,14 @@ fn strip_uuids(s: &str) -> String {
     result
 }
 
+// OOM history comes from journalctl, so each poll forks a subprocess and
+// may read the whole journal window. Two changes make this cheap:
+// poll once a minute (the status bar reports kills up to 8 h old, so a
+// slower poll is invisible), and ask journalctl to seek backwards and
+// stop at the newest match (`-r -n 1`) instead of piping every match of
+// the window through a pipe and keeping the last line.
+const OOM_CHECK_SECS: f64 = 60.0;
+
 impl OomTracker {
     pub fn new(sim: bool) -> Self {
         Self {
@@ -297,7 +403,7 @@ impl OomTracker {
 
     pub fn check(&mut self) {
         let now = Instant::now();
-        if now.duration_since(self.last_check).as_secs_f64() < 5.0 {
+        if now.duration_since(self.last_check).as_secs_f64() < OOM_CHECK_SECS {
             return;
         }
         self.last_check = now;
@@ -326,7 +432,10 @@ impl OomTracker {
 
         let mut candidates: Vec<(f64, String)> = Vec::new();
 
-        // Kernel OOM kills
+        // Kernel OOM kills — reverse order with a one-line limit: the
+        // newest match in the window is the first line, and a window
+        // without matches stays a pure backwards seek. The exit status
+        // is failure when nothing matches, which also skips parsing.
         if let Ok(output) = Command::new("journalctl")
             .args([
                 "-k",
@@ -335,6 +444,9 @@ impl OomTracker {
                 "--no-pager",
                 "-o",
                 "short-unix",
+                "-r",
+                "-n",
+                "1",
                 "--grep",
                 "Killed process",
             ])
@@ -360,6 +472,9 @@ impl OomTracker {
                 "--no-pager",
                 "-o",
                 "short-unix",
+                "-r",
+                "-n",
+                "1",
                 "--grep",
                 "Killed",
             ])
@@ -438,25 +553,147 @@ fn chrono_format_full(epoch: f64) -> String {
             month, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec)
 }
 
-// ── Available/Cached from /proc/meminfo ──
+// ── /proc/meminfo: one read and parse per tick ──
 
-pub fn read_available_cached() -> (u64, u64) {
-    let mut available: u64 = 0;
-    let mut cached: u64 = 0;
-    if let Ok(contents) = fs::read_to_string("/proc/meminfo") {
-        for line in contents.lines() {
-            if let Some(rest) = line.strip_prefix("MemAvailable:") {
-                if let Ok(kb) = rest.trim().trim_end_matches(" kB").trim().parse::<u64>() {
-                    available = kb * 1024;
-                }
-            } else if let Some(rest) = line.strip_prefix("Cached:") {
-                if let Ok(kb) = rest.trim().trim_end_matches(" kB").trim().parse::<u64>() {
-                    cached = kb * 1024;
+/// Everything the Memory panel shows that comes from /proc/meminfo, from a
+/// single read+parse. Values mirror what the previous sysinfo-based
+/// sampling produced bit-for-bit: "kB" fields are KiB and scaled by 1024,
+/// a missing `MemAvailable` (kernel < 3.14) falls back to the pre-3.14
+/// estimate `MemFree + Buffers + Cached + SReclaimable − Shmem`, and
+/// `committed` is `None` unless both commit keys parse (same hiding
+/// semantics as the old standalone `read_committed_limit`).
+#[derive(Clone, Copy)]
+pub struct MemSample {
+    pub total: u64,
+    pub available: u64,
+    pub cached: u64,
+    pub swap_total: u64,
+    pub swap_free: u64,
+    pub committed: Option<(u64, u64)>,
+}
+
+/// `None` when /proc/meminfo cannot be read at all; callers keep the
+/// previous values then, exactly as sysinfo kept its stale fields.
+pub fn read_mem_sample() -> Option<MemSample> {
+    Some(parse_meminfo(&fs::read_to_string("/proc/meminfo").ok()?))
+}
+
+fn parse_meminfo(contents: &str) -> MemSample {
+    let mut total = 0u64;
+    let mut free = 0u64;
+    let mut available = 0u64;
+    let mut available_found = false;
+    let mut buffers = 0u64;
+    let mut cached = 0u64;
+    let mut shmem = 0u64;
+    let mut slab_reclaimable = 0u64;
+    let mut swap_total = 0u64;
+    let mut swap_free = 0u64;
+    let mut committed_as = None;
+    let mut commit_limit = None;
+    for line in contents.lines() {
+        let Some((key, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let kb = rest
+            .trim()
+            .trim_end_matches(" kB")
+            .trim()
+            .parse::<u64>()
+            .ok();
+        match key {
+            "MemTotal" => total = kb.unwrap_or(0),
+            "MemFree" => free = kb.unwrap_or(0),
+            "MemAvailable" => {
+                if let Some(v) = kb {
+                    available_found = true;
+                    available = v;
                 }
             }
+            "Buffers" => buffers = kb.unwrap_or(0),
+            "Cached" => cached = kb.unwrap_or(0),
+            "Shmem" => shmem = kb.unwrap_or(0),
+            "SReclaimable" => slab_reclaimable = kb.unwrap_or(0),
+            "SwapTotal" => swap_total = kb.unwrap_or(0),
+            "SwapFree" => swap_free = kb.unwrap_or(0),
+            "Committed_AS" => committed_as = kb,
+            "CommitLimit" => commit_limit = kb,
+            _ => {}
         }
     }
-    (available, cached)
+    if !available_found {
+        available = free
+            .saturating_add(buffers)
+            .saturating_add(cached)
+            .saturating_add(slab_reclaimable)
+            .saturating_sub(shmem);
+    }
+    MemSample {
+        total: total.saturating_mul(1024),
+        available: available.saturating_mul(1024),
+        cached: cached.saturating_mul(1024),
+        swap_total: swap_total.saturating_mul(1024),
+        swap_free: swap_free.saturating_mul(1024),
+        committed: match (committed_as, commit_limit) {
+            (Some(c), Some(l)) => Some((c.saturating_mul(1024), l.saturating_mul(1024))),
+            _ => None,
+        },
+    }
+}
+
+#[cfg(test)]
+mod meminfo_tests {
+    use super::*;
+
+    #[test]
+    fn parses_committed_and_limit_kib_as_bytes() {
+        let content = "MemTotal:   65000000 kB\nCommitLimit:  40209796 kB\nCommitted_AS:  91134676 kB\n";
+        assert_eq!(
+            parse_meminfo(content).committed,
+            Some((91134676 * 1024, 40209796 * 1024))
+        );
+    }
+
+    #[test]
+    fn missing_or_malformed_commit_keys_are_unavailable() {
+        assert!(parse_meminfo("MemTotal: 1 kB\n").committed.is_none());
+        assert!(parse_meminfo("CommitLimit: 1 kB\n").committed.is_none());
+        assert!(parse_meminfo("Committed_AS: x kB\nCommitLimit: 1 kB\n")
+            .committed
+            .is_none());
+    }
+
+    #[test]
+    fn parses_panel_fields_from_kib_to_bytes() {
+        let content = concat!(
+            "MemTotal:       65000000 kB\n",
+            "MemFree:          500000 kB\n",
+            "MemAvailable:   12000000 kB\n",
+            "Buffers:         1000000 kB\n",
+            "Cached:         19000000 kB\n",
+            "SwapTotal:       8388604 kB\n",
+            "SwapFree:        3000000 kB\n",
+        );
+        let s = parse_meminfo(content);
+        assert_eq!(s.total, 65000000 * 1024);
+        assert_eq!(s.available, 12000000 * 1024);
+        assert_eq!(s.cached, 19000000 * 1024);
+        assert_eq!(s.swap_total, 8388604 * 1024);
+        assert_eq!(s.swap_free, 3000000 * 1024);
+    }
+
+    #[test]
+    fn absent_memavailable_uses_the_pre_314_estimate() {
+        // same formula sysinfo falls back to: free+buffers+cached+slab−shmem
+        let content = concat!(
+            "MemTotal: 1000 kB\nMemFree: 100 kB\nBuffers: 50 kB\n",
+            "Cached: 200 kB\nShmem: 30 kB\nSReclaimable: 25 kB\n",
+        );
+        assert_eq!(parse_meminfo(content).available, (100 + 50 + 200 + 25 - 30) * 1024);
+        // saturating: huge Shmem cannot underflow to a huge available
+        let content = "MemFree: 10 kB\nCached: 5 kB\nShmem: 999999 kB\n";
+        assert_eq!(parse_meminfo(content).available, 0);
+    }
 }
 
 // ── CPU frequency from sysfs ──
@@ -518,9 +755,21 @@ pub struct PowerEstimator {
 
 impl PowerEstimator {
     pub fn new() -> Self {
+        // Resolved once at startup from the shared hwmon table; the
+        // per-tick sample only reads the resulting files.
+        let hwmon_cpu_power_paths = hwmon_table()
+            .iter()
+            .filter(|dev| {
+                matches!(
+                    dev.name.to_ascii_lowercase().as_str(),
+                    "zenpower" | "k10temp" | "coretemp"
+                )
+            })
+            .filter_map(|dev| dev.power_path.clone())
+            .collect();
         Self {
             rapl_zones: detect_rapl_zones(),
-            hwmon_cpu_power_paths: detect_hwmon_cpu_power_paths(),
+            hwmon_cpu_power_paths,
             last_sample: Instant::now(),
             cpu_watts: None,
             access_denied: false,
@@ -631,33 +880,91 @@ fn sample_rapl_cpu_watts(zones: &mut [RaplZone], dt: f64) -> (Option<f64>, bool)
     (found.then_some(total_watts), denied)
 }
 
-fn detect_hwmon_cpu_power_paths() -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    let entries = match fs::read_dir("/sys/class/hwmon") {
-        Ok(entries) => entries,
-        Err(_) => return paths,
-    };
+// ── hwmon path table (discovered once, re-read every 60 s) ──
+//
+// Consumers (CPU/mem temperature sampling, CPU power estimation) used to
+// re-enumerate /sys/class/hwmon and probe dozens of nonexistent
+// temp{N}_{input,crit,max} files on every refresh tick; a single sysfs
+// attribute read costs ~150 µs, so the probe storm dominated the tick.
+// The table resolves the sensor files per hwmon device once and the
+// consumers read only files that exist. The 60 s refresh still picks up
+// sensors whose driver module loads while ktop is running.
 
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = fs::read_to_string(path.join("name"))
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase();
-        if !matches!(name.as_str(), "zenpower" | "k10temp" | "coretemp") {
-            continue;
-        }
+const HWMON_REFRESH_SECS: f64 = 60.0;
 
-        let power1_average = path.join("power1_average");
-        let power1_input = path.join("power1_input");
-        if power1_average.is_file() {
-            paths.push(power1_average);
-        } else if power1_input.is_file() {
-            paths.push(power1_input);
+#[derive(Default)]
+pub struct HwmonDevice {
+    /// Contents of `name`, verbatim (some drivers use mixed case).
+    pub name: String,
+    /// temp{N}_input paths, ascending N.
+    pub temp_inputs: Vec<PathBuf>,
+    /// (temp{N}_crit, temp{N}_max) paths per N over 1..=16; the crit slot
+    /// when the crit file exists, else the max slot when the max file
+    /// exists (mirrors the consumers' crit-else-max precedence).
+    pub temp_limits: Vec<(Option<PathBuf>, Option<PathBuf>)>,
+    /// power1_average, or power1_input when no average exists.
+    pub power_path: Option<PathBuf>,
+}
+
+type HwmonTable = Vec<HwmonDevice>;
+type HwmonArc = std::sync::Arc<HwmonTable>;
+
+fn discover_hwmon_table() -> HwmonTable {
+    let mut devices = Vec::new();
+    if let Ok(entries) = fs::read_dir("/sys/class/hwmon") {
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            let name_path = dir.join("name");
+            let name = fs::read_to_string(&name_path)
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            let mut dev = HwmonDevice {
+                name,
+                ..Default::default()
+            };
+            if name_path.is_file() {
+                for i in 1..=16 {
+                    let input = dir.join(format!("temp{}_input", i));
+                    if input.is_file() {
+                        dev.temp_inputs.push(input);
+                    }
+                    let crit = dir.join(format!("temp{}_crit", i));
+                    if crit.is_file() {
+                        dev.temp_limits.push((Some(crit), None));
+                    } else {
+                        let max = dir.join(format!("temp{}_max", i));
+                        let max = max.is_file().then_some(max);
+                        dev.temp_limits.push((None, max));
+                    }
+                }
+                let avg = dir.join("power1_average");
+                if avg.is_file() {
+                    dev.power_path = Some(avg);
+                } else {
+                    let input = dir.join("power1_input");
+                    if input.is_file() {
+                        dev.power_path = Some(input);
+                    }
+                }
+            }
+            devices.push(dev);
         }
     }
+    devices
+}
 
-    paths
+pub fn hwmon_table() -> HwmonArc {
+    static CACHE: std::sync::LazyLock<std::sync::Mutex<Option<(HwmonArc, Instant)>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+    let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let stale = match guard.as_ref() {
+        Some((_, at)) => at.elapsed().as_secs_f64() >= HWMON_REFRESH_SECS,
+        None => true,
+    };
+    if stale {
+        *guard = Some((std::sync::Arc::new(discover_hwmon_table()), Instant::now()));
+    }
+    guard.as_ref().unwrap().0.clone()
 }
 
 fn sample_hwmon_cpu_watts(paths: &[PathBuf]) -> Option<f64> {
@@ -689,7 +996,7 @@ pub struct NetTracker {
 }
 
 impl NetTracker {
-    pub fn new(_sys: &System) -> Self {
+    pub fn new() -> Self {
         let networks = sysinfo::Networks::new_with_refreshed_list();
         let (sent, recv) = net_totals(&networks);
         Self {
@@ -829,6 +1136,56 @@ fn parse_mem_psi_some(contents: &str) -> Option<(f64, f64, f64)> {
 }
 
 #[cfg(test)]
+mod proc_stat_tests {
+    use super::*;
+
+    /// Build a plausible /proc/<pid>/stat body: `nfields` space-separated
+    /// fields after ") ", starting with the state field exactly like the
+    /// kernel's layout, with given values at 0-based indices.
+    fn stat_bytes(comm: &str, nfields: usize, set: &[(usize, &str)]) -> Vec<u8> {
+        let mut fields: Vec<String> = (0..nfields)
+            .map(|i| if i == 0 { "S".into() } else { format!("{}", i) })
+            .collect();
+        for (i, v) in set {
+            if *i < nfields {
+                fields[*i] = (*v).to_string();
+            }
+        }
+        format!("4242 ({}) {}", comm, fields.join(" ")).into_bytes()
+    }
+
+    #[test]
+    fn parses_utime_stime_and_rss_after_paren() {
+        // utime/stime are fields 11/12 and rss pages field 21 after ') '
+        let stat = stat_bytes("ctest", 22, &[(11, "1000"), (12, "23"), (21, "456")]);
+        assert_eq!(parse_stat_usage(&stat), Some((1000, 23, 456)));
+    }
+
+    #[test]
+    fn comm_with_spaces_and_parentheses_cannot_shift_fields() {
+        // The last-')' rule: a comm like "x) S 0 (y" must not be mistaken
+        // for the end of the comm field.
+        let stat = stat_bytes("x) S 0 (y", 22, &[(11, "7"), (12, "8"), (21, "9")]);
+        assert_eq!(parse_stat_usage(&stat), Some((7, 8, 9)));
+    }
+
+    #[test]
+    fn truncated_or_parenless_stat_is_skipped() {
+        // fewer than 22 fields after the comm (process vanished mid-read)
+        let short = stat_bytes("t", 21, &[(11, "1"), (12, "2")]);
+        assert_eq!(parse_stat_usage(&short), None);
+        assert_eq!(parse_stat_usage(b"no parens here"), None);
+    }
+
+    #[test]
+    fn unparseable_usage_fields_read_as_zero_like_before() {
+        // parse_u64 semantics: a present-but-garbage field yields 0
+        let stat = stat_bytes("g", 22, &[(11, "x"), (12, ""), (21, "5")]);
+        assert_eq!(parse_stat_usage(&stat), Some((0, 0, 5)));
+    }
+}
+
+#[cfg(test)]
 mod mem_psi_tests {
     use super::*;
 
@@ -850,58 +1207,6 @@ mod mem_psi_tests {
         assert!(parse_mem_psi_some("full avg10=0.00 avg60=0.00 avg300=0.00 total=1\n").is_none());
         assert!(parse_mem_psi_some("some avg10=x avg60=0.00 avg300=0.00\n").is_none());
         assert!(parse_mem_psi_some("some avg10=0.00 avg60=0.00\n").is_none());
-    }
-}
-
-// ── Committed_AS / CommitLimit from /proc/meminfo ──
-
-/// Total committed virtual memory and the kernel commit limit, in bytes;
-/// `None` when either key is missing from /proc/meminfo or unparseable.
-pub fn read_committed_limit() -> Option<(u64, u64)> {
-    parse_committed_limit(&fs::read_to_string("/proc/meminfo").ok()?)
-}
-
-fn parse_committed_limit(contents: &str) -> Option<(u64, u64)> {
-    let mut committed = None;
-    let mut limit = None;
-    for line in contents.lines() {
-        if let Some(rest) = line.strip_prefix("Committed_AS:") {
-            committed = rest
-                .trim()
-                .trim_end_matches(" kB")
-                .trim()
-                .parse::<u64>()
-                .ok();
-        } else if let Some(rest) = line.strip_prefix("CommitLimit:") {
-            limit = rest
-                .trim()
-                .trim_end_matches(" kB")
-                .trim()
-                .parse::<u64>()
-                .ok();
-        }
-    }
-    Some((committed? * 1024, limit? * 1024))
-}
-
-#[cfg(test)]
-mod mem_commit_tests {
-    use super::*;
-
-    #[test]
-    fn parses_committed_and_limit_kib_as_bytes() {
-        let content = "MemTotal:   65000000 kB\nCommitLimit:  40209796 kB\nCommitted_AS:  91134676 kB\n";
-        assert_eq!(
-            parse_committed_limit(content),
-            Some((91134676 * 1024, 40209796 * 1024))
-        );
-    }
-
-    #[test]
-    fn missing_or_malformed_keys_are_unavailable() {
-        assert!(parse_committed_limit("MemTotal: 1 kB\n").is_none());
-        assert!(parse_committed_limit("CommitLimit: 1 kB\n").is_none());
-        assert!(parse_committed_limit("Committed_AS: x kB\nCommitLimit: 1 kB\n").is_none());
     }
 }
 
