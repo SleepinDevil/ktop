@@ -10,19 +10,25 @@ A terminal-based system resource monitor built for tracking resource usage when 
 
 ### Latest
 
-- Rewritten from Python to Rust — single static binary, near-zero CPU overhead, instant startup
+- **Intel Arc GPU support** — Alchemist/Battlemage Arc cards via `xe`/`i915` (Arc Pro B70, Arc A770/A750/A380/A310, Arc B580): utilization, VRAM, temperature, and power — no root required
+- **Per-GPU power & PCIe rows** — live watts scaled to each card's driver power limit with history sparkline, live PCIe link speed/width vs max, and PCIe transfer speed (NVIDIA)
+- **Disks panel** — live per-device Read/Write throughput for physical disks, NVMe first
+- **Per-core CPU grid** — braille per-core usage heat-grid with core-count, total %, frequency, and package-power readouts
+- **Deeper memory panel** — PSI memory pressure, committed vs commit-limit, and swap I/O throughput
 - One-line install and upgrade: `curl -sSfL https://raw.githubusercontent.com/brontoguana/ktop/master/install.sh | bash`
 - No runtime dependencies — no Python, no pip, no venv
 
 ### Core
 
-- **GPU Monitoring** — Per-GPU utilization and memory usage with color-coded sparkline history (NVIDIA + AMD)
-- **Network Monitoring** — Upload/download speeds with separate colored sparklines (upload extends up, download extends down)
-- **CPU Monitoring** — Overall CPU usage with gradient bar chart and sparkline history
-- **Memory Monitoring** — RAM and swap usage with gradient progress bars
+- **GPU Monitoring** — Per-GPU utilization and memory usage with color-coded sparkline history (NVIDIA + AMD + Intel Arc)
+- **GPU Power & PCIe** — Per-GPU live power in watts scaled to the card's driver power limit with bar and history sparkline (NVIDIA NVML + AMD hwmon + Intel hwmon), live PCIe link speed/width vs device max, and real-time PCIe transfer speed (NVIDIA via NVML; Intel/AMD expose no link byte counters)
+- **Network Monitoring** — Upload/download speeds with separate colored sparklines (upload extends up, download extends down) and per-direction peak speeds
+- **CPU Monitoring** — Overall CPU usage with gradient bar chart and sparkline history, plus a per-core braille usage grid with core-count, total %, frequency, and CPU package power readouts
+- **Memory Monitoring** — RAM and swap usage with gradient progress bars, memory pressure (PSI), committed vs commit-limit, and swap I/O throughput
+- **Disk Monitoring** — Live per-device Read/Write throughput from `/sys/block` stats (physical disks only, NVMe drives sorted first)
 - **Temperature Strip** — CPU, memory, and per-GPU temps with mini bar charts and hardware-accurate thresholds
 - **OOM Kill Tracker** — Status bar shows the most recent OOM kill from the last 8 hours (kernel OOM and systemd-oomd)
-- **Process Tables** — Top 10 processes by memory (Used/Shared) and CPU usage (Core % + system-wide CPU %)
+- **Process Tables** — Top 20 processes by memory (Used/Shared) and CPU usage (Core % + system-wide CPU %)
 - **50 Color Themes** — Press `t` to browse and switch themes with live preview; persists across sessions
 - **Color Mode Toggle** — Press `c` to switch between truecolor and safe Basic color output; persists across sessions
 - **Gradient Bar Charts** — Smooth per-block color gradients from low to high across all bars
@@ -143,6 +149,7 @@ If a command unexpectedly starts the monitor, check `ktop --version`; terminal d
 - Linux (reads `/proc` and sysfs directly)
 - NVIDIA GPU + drivers (optional — for NVIDIA monitoring)
 - AMD GPU + `amdgpu` driver (optional — for AMD monitoring)
+- **Intel Arc** (Alchemist/Battlemage via `xe`/`i915`): temperature, power, VRAM, and utilization. VRAM used/total comes from Level Zero sysman (`libze_loader.so.1`, loaded at runtime when installed — e.g. the Intel compute stack / XeStrata) and falls back to DRM fdinfo (`/proc/<pid>/fdinfo`, your own GPU processes) and `mem_info_vram_used` (i915); the total falls back to the PCI BAR2 aperture. Utilization uses the xe PMU (whole card, requires `perf_event_paranoid <= 0`) and falls back to DRM fdinfo engine cycles (your processes, no root needed); shows `n/a` when neither is available.
 - No runtime dependencies — single static binary
 
 ## License

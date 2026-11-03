@@ -192,7 +192,11 @@ pub struct AppState {
     pub cpu_total_pct: f64,
     pub cpu_hist: VecDeque<f64>,
     pub cpu_cores: usize,
+    pub cpu_core_pcts: Vec<f64>,
+    pub cpu_power_watts: Option<f64>,
+    pub cpu_power_denied: bool,
     pub cpu_freq: String,
+    pub cpu_name: String,
 
     // Memory
     pub ram_pct: f64,
@@ -203,11 +207,24 @@ pub struct AppState {
     pub swap_pct: f64,
     pub swap_used: u64,
     pub swap_total: u64,
+    // Swap I/O throughput (bytes/sec), from /proc/vmstat pswpin/pswpout.
+    pub swap_io_read: f64,
+    pub swap_io_write: f64,
+
+    // Memory pressure: PSI `some` stall percentages (avg10/60/300), from
+    // /proc/pressure/memory; None when PSI is unavailable.
+    pub mem_psi_some: Option<(f64, f64, f64)>,
+
+    // Committed virtual memory and kernel commit limit (bytes), from
+    // Committed_AS/CommitLimit in /proc/meminfo; None when unparseable.
+    pub mem_committed: Option<(u64, u64)>,
 
     // GPU
     pub gpu_infos: Vec<GpuInfo>,
     pub gpu_util_hist: HashMap<usize, VecDeque<f64>>,
     pub gpu_mem_hist: HashMap<usize, VecDeque<f64>>,
+    pub gpu_power: Vec<Option<f64>>,
+    pub gpu_power_hist: HashMap<usize, VecDeque<f64>>,
 
     // Network
     pub net_up: f64,
@@ -215,6 +232,9 @@ pub struct AppState {
     pub net_up_hist: VecDeque<f64>,
     pub net_down_hist: VecDeque<f64>,
     pub net_max_speed: f64,
+    pub net_max_up: f64,
+    pub net_max_down: f64,
+    pub disks: Vec<system::DiskStat>,
 
     // Temps
     pub cpu_temp: Option<f64>,
@@ -232,6 +252,12 @@ pub struct AppState {
     pub oom_str: Option<String>,
     pub est_power_watts: Option<f64>,
     pub steady_render: bool,
+    // Wall-clock reference for the per-second core-glyph reseed.
+    pub render_base: Instant,
+    // Per-process jitter so paired glyph picks differ across runs.
+    pub rand_base: u64,
+    // Effective refresh interval (drives the idle-flicker frame counter).
+    pub refresh_secs: f64,
 }
 
 pub fn run(
@@ -258,14 +284,18 @@ pub fn run(
     let nvidia = NvidiaState::init();
     let nvidia_count = nvidia.as_ref().map(|n| n.count).unwrap_or(0);
     let amd_cards = gpu::detect_amd_gpus();
-    let gpu_count = nvidia_count + amd_cards.len();
+    let mut intel_cards = gpu::detect_intel_gpus();
+    let intel_base = nvidia_count + amd_cards.len();
+    let gpu_count = intel_base + intel_cards.len();
 
     // Init histories
     let mut gpu_util_hist: HashMap<usize, VecDeque<f64>> = HashMap::new();
     let mut gpu_mem_hist: HashMap<usize, VecDeque<f64>> = HashMap::new();
+    let mut gpu_power_hist: HashMap<usize, VecDeque<f64>> = HashMap::new();
     for i in 0..gpu_count {
         gpu_util_hist.insert(i, VecDeque::with_capacity(HISTORY_LEN));
         gpu_mem_hist.insert(i, VecDeque::with_capacity(HISTORY_LEN));
+        gpu_power_hist.insert(i, VecDeque::with_capacity(HISTORY_LEN));
     }
 
     // Load theme
@@ -285,8 +315,10 @@ pub fn run(
 
     // Init other subsystems
     let mut net_tracker = NetTracker::new(&sys);
+    let mut disk_tracker = system::DiskTracker::new();
     let mut proc_scanner = ProcScanner::new();
     let mut oom_tracker = OomTracker::new(sim);
+    let mut swap_tracker = system::SwapIoTracker::new();
     let mut power_estimator = system::PowerEstimator::new();
     let mut last_freq_check = Instant::now() - Duration::from_secs(10);
 
@@ -320,7 +352,11 @@ pub fn run(
         cpu_total_pct: 0.0,
         cpu_hist: VecDeque::with_capacity(HISTORY_LEN),
         cpu_cores: sys.cpus().len(),
+        cpu_core_pcts: Vec::new(),
         cpu_freq: system::read_cpu_freq().unwrap_or_else(|| "N/A".to_string()),
+        cpu_power_watts: None,
+        cpu_power_denied: false,
+        cpu_name: system::read_cpu_name(),
         ram_pct: 0.0,
         ram_used: 0,
         ram_total: 0,
@@ -329,14 +365,23 @@ pub fn run(
         swap_pct: 0.0,
         swap_used: 0,
         swap_total: 0,
+        swap_io_read: 0.0,
+        swap_io_write: 0.0,
+        mem_psi_some: None,
+        mem_committed: None,
         gpu_infos: Vec::new(),
         gpu_util_hist,
         gpu_mem_hist,
+        gpu_power: Vec::new(),
+        gpu_power_hist,
         net_up: 0.0,
         net_down: 0.0,
         net_up_hist: VecDeque::with_capacity(HISTORY_LEN),
         net_down_hist: VecDeque::with_capacity(HISTORY_LEN),
         net_max_speed: 1.0,
+        net_max_up: 1.0,
+        net_max_down: 1.0,
+        disks: Vec::new(),
         cpu_temp: None,
         cpu_temp_max: 100.0,
         mem_temp: None,
@@ -348,11 +393,15 @@ pub fn run(
         oom_str: None,
         est_power_watts: None,
         steady_render: compat,
+        render_base: Instant::now(),
+        rand_base: (std::process::id() as u64) ^ 0x9E37_79B9_7F4A_7C15,
+        refresh_secs: refresh,
     };
 
     let refresh_dur = Duration::from_secs_f64(refresh);
     let mut last_refresh = Instant::now() - refresh_dur;
     let mut pending_resize: Option<(Rect, Instant)> = None;
+    let mut core_smooth: Vec<f64> = Vec::new();
 
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
         loop {
@@ -403,7 +452,19 @@ pub fn run(
                 // Sample CPU
                 sys.refresh_cpu_usage();
                 state.cpu_pct = sys.global_cpu_usage() as f64;
-                state.cpu_total_pct = sys.cpus().iter().map(|c| c.cpu_usage() as f64).sum();
+                let core_raws: Vec<f64> =
+                    sys.cpus().iter().map(|c| c.cpu_usage() as f64).collect();
+                state.cpu_total_pct = core_raws.iter().sum();
+                // EMA-smooth per-core usage (same 0.65/0.35 blend as the
+                // process table) so the grid cells don't flicker between ticks
+                if core_smooth.len() != core_raws.len() {
+                    core_smooth = core_raws.clone();
+                } else {
+                    for (s, r) in core_smooth.iter_mut().zip(core_raws.iter()) {
+                        *s = *s * 0.65 + r * 0.35;
+                    }
+                }
+                state.cpu_core_pcts = core_smooth.clone();
                 state.cpu_hist.push_back(state.cpu_pct);
                 if state.cpu_hist.len() > HISTORY_LEN {
                     state.cpu_hist.pop_front();
@@ -435,6 +496,11 @@ pub fn run(
                 } else {
                     0.0
                 };
+                let (swap_r, swap_w) = swap_tracker.sample();
+                state.swap_io_read = swap_r;
+                state.swap_io_write = swap_w;
+                state.mem_psi_some = system::read_mem_psi_some();
+                state.mem_committed = system::read_committed_limit();
 
                 // GPUs
                 let mut gpu_infos = Vec::new();
@@ -444,17 +510,24 @@ pub fn run(
                 for (j, card) in amd_cards.iter().enumerate() {
                     gpu_infos.push(card.sample(nvidia_count + j));
                 }
+                for (j, card) in intel_cards.iter_mut().enumerate() {
+                    gpu_infos.push(card.sample(intel_base + j));
+                }
                 for g in &gpu_infos {
-                    if let Some(hist) = state.gpu_util_hist.get_mut(&g.id) {
-                        hist.push_back(g.util);
-                        if hist.len() > HISTORY_LEN {
-                            hist.pop_front();
+                    if g.has_util {
+                        if let Some(hist) = state.gpu_util_hist.get_mut(&g.id) {
+                            hist.push_back(g.util);
+                            if hist.len() > HISTORY_LEN {
+                                hist.pop_front();
+                            }
                         }
                     }
-                    if let Some(hist) = state.gpu_mem_hist.get_mut(&g.id) {
-                        hist.push_back(g.mem_pct);
-                        if hist.len() > HISTORY_LEN {
-                            hist.pop_front();
+                    if g.has_mem {
+                        if let Some(hist) = state.gpu_mem_hist.get_mut(&g.id) {
+                            hist.push_back(g.mem_pct);
+                            if hist.len() > HISTORY_LEN {
+                                hist.pop_front();
+                            }
                         }
                     }
                 }
@@ -468,21 +541,45 @@ pub fn run(
                 for card in &amd_cards {
                     gpu_temps.push(card.temp());
                 }
+                for card in &intel_cards {
+                    gpu_temps.push(card.temp());
+                }
                 state.gpu_temps = gpu_temps;
 
+                // Per-GPU live power (NVML mW / AMD power1_average / Intel
+                // energy-delta), sampled once per tick and reused by the
+                // footer estimate. Order matches gpu_infos: NVIDIA, AMD, Intel.
                 let cpu_power = power_estimator.sample_cpu_watts();
-                let nvidia_power = nvidia
-                    .as_ref()
-                    .map(|nv| nv.power_watts().into_iter().flatten().sum::<f64>())
-                    .unwrap_or(0.0);
-                let amd_power: f64 = amd_cards.iter().filter_map(|card| card.power_watts()).sum();
-                let total_power = cpu_power.unwrap_or(0.0) + nvidia_power + amd_power;
-                state.est_power_watts =
-                    if cpu_power.is_some() || nvidia_power > 0.0 || amd_power > 0.0 {
-                        Some(total_power)
-                    } else {
-                        None
-                    };
+                state.cpu_power_watts = cpu_power;
+                state.cpu_power_denied = power_estimator.access_denied;
+                let mut gpu_power: Vec<Option<f64>> = Vec::new();
+                if let Some(nv) = &nvidia {
+                    gpu_power.extend(nv.power_watts());
+                }
+                for card in amd_cards.iter() {
+                    gpu_power.push(card.power_watts());
+                }
+                for card in intel_cards.iter_mut() {
+                    gpu_power.push(card.power_watts());
+                }
+                let gpu_power_total: f64 = gpu_power.iter().flatten().sum();
+                for (g, p) in state.gpu_infos.iter().zip(gpu_power.iter()) {
+                    if let Some(w) = p {
+                        if let Some(hist) = state.gpu_power_hist.get_mut(&g.id) {
+                            hist.push_back(*w);
+                            if hist.len() > HISTORY_LEN {
+                                hist.pop_front();
+                            }
+                        }
+                    }
+                }
+                state.gpu_power = gpu_power;
+                let total_power = cpu_power.unwrap_or(0.0) + gpu_power_total;
+                state.est_power_watts = if cpu_power.is_some() || gpu_power_total > 0.0 {
+                    Some(total_power)
+                } else {
+                    None
+                };
 
                 // CPU temps via sysinfo
                 sample_temps(&sys, &mut state);
@@ -493,6 +590,8 @@ pub fn run(
                 state.net_up = up;
                 state.net_down = down;
                 state.net_max_speed = net_tracker.max_speed;
+                state.net_max_up = net_tracker.max_up;
+                state.net_max_down = net_tracker.max_down;
                 state.net_up_hist.push_back(up);
                 state.net_down_hist.push_back(down);
                 if state.net_up_hist.len() > HISTORY_LEN {
@@ -501,6 +600,9 @@ pub fn run(
                 if state.net_down_hist.len() > HISTORY_LEN {
                     state.net_down_hist.pop_front();
                 }
+
+                // Disks: live per-device read/write throughput.
+                state.disks = disk_tracker.sample();
 
                 // Processes
                 let proc_scan_secs = if state.steady_render {

@@ -1,5 +1,98 @@
 # Changelog
 
+## Unreleased
+- Memory panel: new `{} committed / {} limit` line (`Committed_AS` / `CommitLimit` from `/proc/meminfo`, hidden when unparseable) inserted under the `avail / cached` line, and the blank separator between the RAM and Swap groups (below the PSI line) removed so the panel is exactly 8 content lines; Top Processes lists now keep up to 20 rows instead of 10 (`MAX_PROCS`); main layout now fixes the mid row to exactly 10 rows (the three mid panels' 8-line maximum) and gives the procs row `Constraint::Min(5)` — all vertical slack and all of the first stage of shrinking go to the process panels (down to two process rows + header + borders) while GPU/mid/temps/disks/status keep their exact sizes
+  - Tested: `cargo check`, `cargo test` (new `parses_committed_and_limit_kib_as_bytes`, `missing_or_malformed_keys_are_unavailable`), `cargo build --release`, 120x60/40/36/34/30 PTY captures verifying the 8-line Memory panel, 20 process rows, and the shrink priority
+
+- Memory panel: new line under the RAM `avail / cached` line showing memory pressure — the PSI `some` stall percentages as `PSI some avg10/avg60/avg300%`, parsed from `/proc/pressure/memory` each refresh — and hidden entirely when PSI is unavailable (kernel < 4.20 or pressure disabled at boot)
+  - Tested: `cargo check`, `cargo test` (new `parses_some_stall_averages_from_psi_content`, `parses_some_line_regardless_of_key_order`, `missing_or_malformed_some_line_is_unavailable`), `cargo build --release`, 120x60 PTY capture showing the PSI line
+
+- Network panel: the single `Peak:` line (max of up/down) under the Down readout is now split into two per-direction lines — `Peak Down:` under the Down line and a new `Peak Up:` line directly under the Up line — backed by independent `max_up`/`max_down` running maxima in `NetTracker`; the combined `max_speed` is kept untouched as the sparkline/bar scale bound
+  - Tested: `cargo check`, `cargo test`, `cargo build --release`, 120x60 PTY capture showing both peak lines
+
+- Memory panel: moved the `avail`/`Cache` detail line up to sit directly under the RAM `used / total` line (the blank separator between the RAM and Swap groups removed) and added a new line under the Swap `used / total` showing swap I/O throughput as `R <rate>  W <rate>` — pages read into RAM from swap (`pswpin`) and written out (`pswpout`) from `/proc/vmstat` × page size, delta-sampled per refresh like the network tracker, colored with the same R=net_down/W=net_up pair the Disks panel uses; reads `0 B/s` on systems whose swap layer does not bump the counters (e.g. zswap-only)
+  - Tested: `cargo check`, `cargo test` (new `reads_pswpin_pswpout_from_vmstat`), `cargo build --release`, 120x60 PTY capture showing the reordered Memory panel with the swap I/O row
+
+- CPU panel: sub-threshold idle cores (usage below the 6.25% single-dot cut, so bucket 0) now flicker in the grid — each render frame a 20% chance to show exactly one raised dot at any of the 16 positions across the core's two glyphs (uniform, both glyphs), otherwise fully blank, so the grid always has some activity to look at; deterministically derived from the frame counter (`render_base.elapsed()/refresh`) so redraws inside one frame are identical, colored at the `bar_low` end of the gradient; compat/steady ASCII mode stays blank for idle cores
+  - Tested: `cargo test` (new `idle_core_flickers_one_dot_across_the_two_glyphs`, `idle_flicker_is_deterministic_per_frame`), `cargo build --release`, live-terminal check
+- CPU panel: the per-core grid now shows each core as two random braille glyphs (U+2800..U+28FF) drawn from the dot-count bucket matching the core's usage (bucket k = every glyph with round(pct/12.5) raised dots: 0/8 dots at 0% up to the solid `⣿⣿` at 100%), replacing the `░▒▓█` shade ramp; pairs re-roll once per wall-clock second and stay stable across frames inside the same second, and each pair is colored by the smooth `bar_low`..`bar_high` gradient at its own usage (same as the GPU Util bars) instead of the stepped low/mid/high bands; compat/steady mode keeps ASCII pairs bucketed by the same dot counts (e.g. `#=` for a pegged core, `..` at 25%)
+  - Tested: `cargo check`, `cargo test` (new `braille_tables_cover_every_braille_glyph_exactly_once`, `braille_bucket_rounds_usage_to_nearest_eighth`, `core_glyph_pair_is_two_chars_from_the_usage_bucket`, `glyph_pair_is_stable_within_a_second_and_rerolls_across_seconds`, `ascii_fallback_pairs_use_the_bucket_and_the_one_below`), `cargo build --release`, manual live-terminal confirmation of the grid
+- CPU panel power row now shows `⌁: SU req` when the RAPL package zone exists but its energy counters are root-only (PLATYPUS lockdown, i.e. ktop run without privileges), keeping `n/a` for systems that expose no CPU package power at all
+  - Tested: `cargo test` (new `missing_energy_counter_is_unavailable_not_denied`), `cargo build --release`, 120x60 PTY capture on the root-locked 5950X box showing `⌁: SU req`
+- CPU panel: added a blank line between the two-row history sparkline and the per-core grid
+  - Tested: `cargo build --release`, 120x60 PTY capture showing sparkline rows, blank separator, then the grid
+- CPU panel: core-grid symbol changed to `⊞` (U+229E) and power symbol to `⌁` (U+2301); the grid + readout block is now centered in the panel when the inner width fits it, and on narrow panels the grid is clipped column-by-column (whole cells only) so the `Σ:`/`ƒ:`/`⌁:` readouts stay visible
+  - Tested: `cargo build --release`, 120x60 PTY capture showing the block centered with 4-column padding and 90x40 capture showing the grid clipped to 7 columns with all readouts intact
+- CPU panel: dropped the `Cores:`/`Total:`/`Freq:` row and the gaps between grid columns; the per-core grid now carries those readouts down its right side as `▦: <cores>`, `Σ: <total%>`, `ƒ: <freq>` and a new `⚡: <watts>` row showing CPU package power (RAPL; `n/a` when the energy counters are not readable, e.g. unprivileged access on AMD; ASCII `C:`/`T:`/`F:`/`P:` fallbacks in compat/steady mode)
+  - Tested: `cargo test` (9 passed), `cargo build --release`, 120x60 PTY capture under load showing gapless `██░░…` grid rows with `▦: 32`, `Σ: 243%`, `ƒ: 4772 MHz` and `⚡: n/a` right of the grid
+- Added a per-core usage grid to the CPU panel below the `Cores:` row: up to 8 columns x 4 rows of two-character shade cells (`░░▒▒▓▓██`, ASCII `. : = #` in compat/steady mode), each colored by the bar ramp (low/mid/high); per-core values are EMA-smoothed (0.65/0.35, same blend as the process table); machines with more than 32 cores group cores so each cell shows the hottest core of its group
+  - Tested: `cargo check`, `cargo test` (new `lays_out_thirty_two_cores_as_four_rows_of_eight`, `groups_beyond_thirty_two_cores_by_max`, `short_core_counts_use_partial_rows`), `cargo build --release`, 120x60 PTY capture under 3-core load showing `██` hot cells in `bar_high` and `░░` idle cells in `bar_low`, and a `--compat` capture showing the ASCII ramp
+
+- Panel appearance tweaks: Network panel dropped the blank line between `Down` and the peak row and renamed it `Peak Down` in white; CPU panel dropped the `History` label, moved the sparkline above the `Cores:` row (now white), and the bottom CPU name matches the panel border theme color; Memory panel colors the Swap percentage by usage (was static grey) and shows the two lines below Swap in white; Disks panel border/title now use the same theme color as Temps (`bar_mid`); GPU panel card names at the bottom match the panel border color
+  - Tested: `cargo check`, `cargo test`, `cargo build --release`, 120x60 truecolor PTY capture confirming `Peak Down`/`Cores:`/swap detail lines emit classic white SGR (`97`), Swap % follows the bar color ramp, CPU/GPU bottom titles share their border color, and Disks/Temps borders are both `bar_mid`
+
+- Intel GPU PCIe link stats now read from the top-most upstream switch port in the card's sysfs topology (first non-root-bus bridge, e.g. `0000:0b:00.0` for a Battlemage card behind a PCIe switch) instead of the endpoint itself, because the xe driver pins the endpoint's own `current_link_speed`/`current_link_width` at the idle floor (2.5 GT/s x1); GPUs on a root port directly are unchanged
+  - Tested: `cargo check`, `cargo test` (new `picks_topmost_non_root_bridge_from_sysfs_path`), `cargo build --release`, PTY capture showing `PCIe G4 x8 (max G5 x16)` for the Intel Arc Pro B70 behind the switch and unchanged NVIDIA `PCIe G4 x8 (max G4 x16)`
+
+- Added `AGENTS.md` repository guidelines for AI coding assistants (architecture, data flow, commands, conventions, QA workflow)
+- Slimmed `CLAUDE.md` to mandatory rules only, pointing to `AGENTS.md` (guidelines) and `CHANGELOG.md` (canonical history); removed its duplicated condensed changelog
+- Refreshed the `README.md` feature list for everything added since v1.0.17: Intel Arc GPU support, per-GPU power & PCIe rows, the Disks panel, the per-core CPU grid, the memory panel's PSI pressure / committed-limit / swap-I/O lines, per-direction network peak lines, and the 20-row process tables; updated `AGENTS.md` module/data-flow/testing descriptions to match the current code
+- Tested: docs-only change; no code touched, no build required
+
+
+
+## 1.0.23 — 2026-10-18
+
+- Added a Disks panel below Temps: live per-device Read/Write throughput from `/sys/block/<dev>/stat` deltas, physical disks only (nvme/sd/vd/mmcblk; loop/ram/zram/dm/partitions skipped), NVMe drives sorted first, laid out 3 disks per row
+- Fixed the Pwr history sparkline: bar heights are now watts ÷ card power limit (was raw watts clamped to 100, so any card above ~100 W pinned the graph to full height)
+- CPU panel name drops the core-count suffix: `AMD Ryzen 9 5950X` (was `AMD Ryzen 9 5950X 16-Core Processor`)
+- GPU panel names keep the vendor: `NVIDIA GeForce RTX 3080 Ti`, `Intel Arc Pro B70`
+- Fixed a blank trailing row in the Disks panel: panel height is now `ceil(n/3) + 2` (border + rows) instead of `+ 3`
+- Tested: `cargo test` (5 passed), `cargo build --release` (0 warnings), PTY frame capture: Disks panel `nvme0n1/nvme1n1/sda` row 1 + `sdb/sdc/sdd` row 2 with live `R 38.2 KB/s` and `W 167.9 KB/s` under `dd oflag=direct` load, Pwr sparkline low bars at 37 W/370 W, CPU border `AMD Ryzen 9 5950X`, GPU borders with vendor names
+
+## 1.0.22 — 2026-10-18
+
+- PCIe row now shows the live trained link only (`PCIe G4 x8`), with `(max G4 x16)` appended only when running below the device max; removed the confusing `current → max` arrow notation and the yellow degraded coloring — the row is plain white like the rest of the panel
+- Added a blank line above the PCIe row to match the Util→Mem and Mem→Pwr gaps
+- CPU panel bottom border now shows the processor name from `/proc/cpuinfo` (e.g. `AMD Ryzen 9 5950X 16-Core Processor`), matching the GPU panels' card-name style
+- Intel PCIe link is sampled live every tick from the same sysfs file nvtop reads (`current_link_speed`/`current_link_width` of the GPU endpoint); the xe driver parks the B70 at G1 x1 when idle and retrains under load — ktop reflects the file as it changes
+- Tested: `cargo test` (5 passed), `cargo build --release` (0 warnings), PTY frame capture: `PCIe G1 x8 (max G4 x16) ↓ 0.6 ↑ 0.7 MB/s` (NVIDIA), `PCIe G1 x1` (B70, no max suffix), gap above PCIe, CPU border `AMD Ryzen 9 5950X 16-Core Processor`; strace confirmed nvtop reads the same endpoint `current_link_speed`
+
+## 1.0.21 — 2026-10-18
+
+- Pwr bars now scale to the card's power limit (max power) from the driver — NVML `power_management_limit` (NVIDIA), `power1_cap` (AMD), `power1_cap`/`power1_max` (Intel) — and the readout shows `current/limit W` (e.g. `42.0/ 370 W`); falls back to observed peak when no limit is exposed
+- Added live PCIe transfer speed to the GPU panel PCIe row (NVIDIA via NVML `nvmlDeviceGetPcieThroughput` RX/TX KB/s → `↓ x.x ↑ x.x MB/s`); Intel/AMD expose no PCIe byte-throughput counter (XeStrata reports `None` for Intel too), so the row shows link speed/width only there
+- Added a blank line above the Pwr row to match the Util→Mem gap
+- Fixed the large white space below the PCIe row: GPU panel is now a fixed `Length(13)` sized to its content; the freed rows go to the process panel
+- Tested: `cargo test` (5 passed), `cargo build --release` (0 warnings), PTY frame capture: `42.0/ 370 W` (RTX 3080 Ti) and `45.2/ 275 W` (Arc Pro B70, `power1_cap` 275 W), `PCIe G1 x8 → G4 x16 ↓ 1.7 ↑ 8.1 MB/s` (NVIDIA), B70 row without throughput, gap above Pwr, no trailing blank rows in GPU panel
+
+## 1.0.20 — 2026-10-18
+
+- Moved the per-GPU `Pwr` bar + sparkline into the GPU panel columns (under Util/Mem) and removed the standalone Pwr row; GPU panel now gets more vertical space (`Fill(3)`)
+- Added a live `PCIe` row per GPU: current trained link speed/width vs device max from sysfs (`current_link_speed`/`current_link_width`, `max_link_speed`/`max_link_width`), yellow when running below max (e.g. `PCIe G4 x8 → G4 x16`)
+- PCIe link state works for all vendors via the PCI device sysfs (NVML `nvmlDeviceGetPciInfo` link fields return 0 and Level Zero `zesDevicePciGetState`/`GetStats` are unsupported on current NVIDIA/Intel stacks; no per-device PCIe byte-throughput counter exists in NVML, L0 sysman, or the kernel)
+- Tested: `cargo test` (5 passed), `cargo build --release` (0 warnings), PTY smoke on RTX 3080 Ti + Arc Pro B70: Pwr bar/sparkline under Mem in each GPU column, `PCIe G4 x8 → G4 x16` (yellow, NVIDIA) and `PCIe G1 x1 → G1 x1` (xe power-managed link, B70)
+
+## 1.0.19 — 2026-10-18
+
+- Added a per-GPU `Pwr` panel between the net/CPU/Mem row and the Temps panel: live watts with a bar (scaled to the observed peak, 100 W floor) and a history sparkline per GPU
+- Sources: NVIDIA NVML `nvmlDeviceGetPowerUsage` (instantaneous mW), AMD `power1_average` (µW), Intel xe `energy1_input` µJ deltas / i915 `power1_max`/`power1_average`; cards without a live sensor show `n/a`
+- Per-GPU power is now sampled once per refresh tick into `AppState.gpu_power`/`gpu_power_hist` and reused for the footer power estimate (previously the footer summed three separate per-vendor calls)
+- Tested: `cargo test` (5 passed), `cargo build --release` (0 warnings), PTY smoke on RTX 3080 Ti + Arc Pro B70: Pwr panel shows live watts and sparklines for both GPUs, footer `PWR` estimate unchanged
+
+## 1.0.18 — 2026-10-18
+
+- Added Intel Arc GPU detection and monitoring (Alchemist/Battlemage via `xe`/`i915` sysfs)
+- Detection matches PCI vendor `0x8086` on DRM cards; integrated Intel GPUs are included (consistent with AMD APUs) and render with the sensors they expose
+- Temperature selects the hwmon input labeled `pkg` (xe/Battlemage) with fallback to `temp1_input` (i915); max from `tempN_crit`/`tempN_max`
+- Live power computed from `energy1_input` (µJ) deltas on xe, falling back to `power1_max`/`power1_average` (i915); summed into the footer power estimate
+- Name Intel cards from a PCI device-id table (Arc Pro B70, Arc A770/A750/A380/A310, Arc B580) with `Intel GPU [0x…]` fallback
+- Add Intel VRAM used/total from Level Zero sysman (`libze_loader.so.1` dlopened at runtime, `ZES_ENABLE_SYSMAN=1` set automatically, device matched by PCI BDF) — card-wide, no root, no perf; falls back to summing `drm-active-vram0` from `/proc/<pid>/fdinfo` (the user's own GPU processes), then to `mem_info_vram_used` (i915)
+- Add Intel utilization from the xe PMU (engine-active/total-ticks, render class) via raw `perf_event_open` when permitted, falling back to DRM fdinfo engine cycles (`drm-cycles-rcs/ccs` ÷ `drm-engine-capacity-*` over `drm-total-cycles-*` deltas) which works without root; shows `n/a` when neither source is available
+- Add Intel VRAM total from the PCI BAR2 aperture when `mem_info_vram_total` is absent (32 GiB on Arc Pro B70); Level Zero sysman total (31.9 GiB) takes precedence when present
+- Gate the Mem bar, GB line, and sparkline on VRAM availability so unavailable memory reads `n/a` instead of a fake 0%
+- Tested: `cargo test` (5 passed, incl. new fdinfo_scan fake-proc test), `cargo build --release`, PTY smoke on Intel Arc Pro B70 (xe) + RTX 3080 Ti (NVML): panel titled "Arc Pro B70" with `Util 32.0%` (fdinfo, XeStrata engine active), `Mem 99.2%` `31.6/31.9 GB` (Level Zero sysman), pkg temp 64/105°C, PWR ~165 W includes B70; NVIDIA GPU unchanged; note nvtop shows no Intel GPU on this host (`perf_event_paranoid=4` blocks its PMU source)
+
 ## 1.0.17 — 2026-05-06
 
 - Restored color in Basic mode without using extended foreground color escapes

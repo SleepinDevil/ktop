@@ -1,3 +1,10 @@
+# ktop — Agent Instructions
+
+Full repository guidelines (project overview, architecture & data flow, key directories, development commands, code conventions, important files, runtime/tooling, testing & QA): see **AGENTS.md**.
+
+Changelog history lives in **CHANGELOG.md** (canonical, newest-first). Do not duplicate it here.
+
+## Mandatory rules
 
 Add changes you make to the changelog including tests you run.
 
@@ -9,86 +16,3 @@ Then copy the binary to install locally:
 **CRITICALLY IMPORTANT INSTRUCTIONS BELOW THIS LINE**
 
 **You must NEVER PUSH TO GITHUB without explicitly asking the user!**
-
-## Changelog
-
-### v1.0.17
-- Restore color in Basic mode without using extended foreground color escapes
-- Rewrite crossterm standard-palette `38;5;n` / `48;5;n` SGR into classic ANSI `30-37` / `90-97` and `40-47` / `100-107`
-- Map theme RGB colors to visible classic ANSI colors in Basic mode so text, borders, bars, and status accents are colored again
-- Tested: `cargo check`, `cargo test`, `cargo build --release`, PTY capture with zero RGB foreground, zero indexed foreground, zero blink SGR, and classic ANSI color output in Basic mode
-
-### v1.0.16
-- Make Basic color mode avoid all extended foreground color escapes, including indexed `38;5;n` as well as RGB `38;2;r;g;b`
-- Reset/clear the terminal immediately when toggling color mode to repaint stale truecolor-styled cells
-- Keep truecolor as the default; Basic is now the safe monochrome fallback for terminals that flash on extended foreground color sequences
-- Tested: `cargo check`, debug build, PTY capture with zero RGB foreground and zero indexed foreground SGR in Basic mode
-
-### v1.0.15
-- Add a main-screen `c Color` toggle after `t Theme` to switch between truecolor and basic ANSI colors
-- Persist the selected color mode in `~/.config/ktop/config.json` alongside the theme, with truecolor as the default for existing configs
-- Map RGB/indexed theme colors to ANSI/basic colors when Basic color mode is active
-- Tested: `cargo check`, `cargo build --release`, PTY smoke for persisted `c` toggle and RGB-SGR removal in Basic mode
-
-### v1.0.14
-- Buffer terminal stdout before ratatui writes frames to reduce fragmented output over remote transports
-- Simplify `--compat` progress bars to one filled span plus one empty span instead of per-cell RGB gradients
-
-### v1.0.13
-- Make `--compat` avoid dark-gray ANSI styling and shaded filler glyphs for terminals that animate stale gray cells after process exit
-- Clear/reset the current screen on compat entry/exit so stale TUI cells do not remain behind the shell prompt
-- Reset terminal attributes and colors during cleanup
-
-### v1.0.12
-- Smooth process CPU percentages before sorting/display to reduce lower-screen row churn
-- Add deterministic process-table tie breakers
-- Make `--compat` a lower-churn mode by suppressing moving sparklines and refreshing process tables every 10s
-
-### v1.0.11
-- Add `ktop diagnose-render` for visual repaint isolation on terminals with stable size diagnostics but flashing TUI repaint
-- Cases: plain, cursor, color, rgb, unicode, full-paint, clear, alternate, sync
-
-### v1.0.10
-- Avoid repeated terminal clears from unstable resize reporting by using a fixed viewport and debounced resize handling
-- Add `ktop diagnose-terminal` for terminal size and resize-event diagnostics
-- Add `--compat` / `KTOP_COMPAT=1` for conservative remote terminal drawing
-- Compatibility mode disables alternate screen and synchronized redraws, skips startup clears, and defaults to 2s refresh unless `-r` is set
-- Unknown commands/options now fail with a usage error instead of launching the TUI
-- Terminal diagnostics still print size samples when stdin event polling is unavailable
-
-### v1.0.9
-- Add `ktop update` to run the README one-line update installer
-- Add `ktop uninstall` to remove only the resolved `ktop` executable and leave config/system files untouched
-- Tested: `cargo check`, `cargo build --release`, command help smoke tests, temp-copy uninstall smoke test
-
-### v1.0.8
-- Reduce repaint flashing on remote/web terminals by wrapping draws in synchronized terminal updates
-- Hide the cursor while ktop is running and restore it on exit
-- Add `--no-alt-screen` / `KTOP_NO_ALT_SCREEN=1` and `--no-sync` / `KTOP_NO_SYNC=1` compatibility fallbacks
-- Clamp refresh intervals below 0.25s to avoid accidental tight redraw loops
-- Cap footer right-side status width to the visible terminal width on narrow terminals
-- Tested: `cargo check`, `cargo build --release`
-
-### v1.0.7
-- Keep the footer power slot visible on narrower terminals by right-anchoring power and OOM status
-- Let the left-side help text truncate first instead of clipping PWR off the screen
-- Tested: `cargo build --release`
-
-### v1.0.6
-- Always show the footer power slot
-- Display `PWR n/a` when the host exposes no usable power telemetry instead of hiding the field entirely
-- Use saturating footer padding so the power segment is not squeezed out on narrower terminals
-- Tested: `cargo build --release`
-
-### v1.0.5
-- Add footer power estimate segment before OOM status when live sensors are available
-- Estimate uses CPU package power from Linux powercap/hwmon plus NVIDIA NVML and AMD hwmon GPU power
-- Hide the power field when the host exposes no usable power sensors instead of showing a fake value
-- Tested: `cargo build --release`
-
-### v1.0.4
-- Switch from musl static linking to glibc dynamic linking for NVIDIA GPU compatibility
-- musl binaries can't dlopen glibc-linked .so files (like libnvidia-ml.so), causing GPU detection to silently fail
-- CI now uses `cross` tool to build in older-glibc Docker containers for portability
-- install.sh updated to fetch gnu-targeted binaries
-- Tested: local build, version check, ldd confirms dynamic linking

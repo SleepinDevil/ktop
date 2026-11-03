@@ -208,6 +208,161 @@ fn muted_bold_style(steady: bool, truecolor: bool) -> Style {
     muted_style(steady, truecolor).add_modifier(Modifier::BOLD)
 }
 
+fn white_style(truecolor: bool) -> Style {
+    Style::default().fg(display_color(Color::White, truecolor))
+}
+
+// ── Per-core grid ──
+
+const GRID_COLS: usize = 8;
+const GRID_CELLS: usize = 32;
+// Braille glyph buckets for the per-core grid: index = round(pct / 12.5),
+// i.e. the bucket holds every U+2800..U+28FF glyph with exactly that many
+// raised dots (bucket size = C(8, dots)). Each render picks two glyphs at
+// random from the core's bucket and colors the pair with the same
+// bar_low..bar_high gradient the utilization bars use.
+const BRAILLE: &[&[char]] = &[
+    // 0 dots — 0%
+    &['\u{2800}'],
+    // 1 dot — 12.5%
+    &[
+        '\u{2801}', '\u{2802}', '\u{2804}', '\u{2808}', '\u{2810}', '\u{2820}', '\u{2840}',
+        '\u{2880}',
+    ],
+    // 2 dots — 25%
+    &[
+        '\u{2803}', '\u{2805}', '\u{2806}', '\u{2809}', '\u{280A}', '\u{280C}', '\u{2811}',
+        '\u{2812}', '\u{2814}', '\u{2818}', '\u{2821}', '\u{2822}', '\u{2824}', '\u{2828}',
+        '\u{2830}', '\u{2841}', '\u{2842}', '\u{2844}', '\u{2848}', '\u{2850}', '\u{2860}',
+        '\u{2881}', '\u{2882}', '\u{2884}', '\u{2888}', '\u{2890}', '\u{28A0}', '\u{28C0}',
+    ],
+    // 3 dots — 37.5%
+    &[
+        '\u{2807}', '\u{280B}', '\u{280D}', '\u{280E}', '\u{2813}', '\u{2815}', '\u{2816}',
+        '\u{2819}', '\u{281A}', '\u{281C}', '\u{2823}', '\u{2825}', '\u{2826}', '\u{2829}',
+        '\u{282A}', '\u{282C}', '\u{2831}', '\u{2832}', '\u{2834}', '\u{2838}', '\u{2843}',
+        '\u{2845}', '\u{2846}', '\u{2849}', '\u{284A}', '\u{284C}', '\u{2851}', '\u{2852}',
+        '\u{2854}', '\u{2858}', '\u{2861}', '\u{2862}', '\u{2864}', '\u{2868}', '\u{2870}',
+        '\u{2883}', '\u{2885}', '\u{2886}', '\u{2889}', '\u{288A}', '\u{288C}', '\u{2891}',
+        '\u{2892}', '\u{2894}', '\u{2898}', '\u{28A1}', '\u{28A2}', '\u{28A4}', '\u{28A8}',
+        '\u{28B0}', '\u{28C1}', '\u{28C2}', '\u{28C4}', '\u{28C8}', '\u{28D0}', '\u{28E0}',
+    ],
+    // 4 dots — 50%
+    &[
+        '\u{280F}', '\u{2817}', '\u{281B}', '\u{281D}', '\u{281E}', '\u{2827}', '\u{282B}',
+        '\u{282D}', '\u{282E}', '\u{2833}', '\u{2835}', '\u{2836}', '\u{2839}', '\u{283A}',
+        '\u{283C}', '\u{2847}', '\u{284B}', '\u{284D}', '\u{284E}', '\u{2853}', '\u{2855}',
+        '\u{2856}', '\u{2859}', '\u{285A}', '\u{285C}', '\u{2863}', '\u{2865}', '\u{2866}',
+        '\u{2869}', '\u{286A}', '\u{286C}', '\u{2871}', '\u{2872}', '\u{2874}', '\u{2878}',
+        '\u{2887}', '\u{288B}', '\u{288D}', '\u{288E}', '\u{2893}', '\u{2895}', '\u{2896}',
+        '\u{2899}', '\u{289A}', '\u{289C}', '\u{28A3}', '\u{28A5}', '\u{28A6}', '\u{28A9}',
+        '\u{28AA}', '\u{28AC}', '\u{28B1}', '\u{28B2}', '\u{28B4}', '\u{28B8}', '\u{28C3}',
+        '\u{28C5}', '\u{28C6}', '\u{28C9}', '\u{28CA}', '\u{28CC}', '\u{28D1}', '\u{28D2}',
+        '\u{28D4}', '\u{28D8}', '\u{28E1}', '\u{28E2}', '\u{28E4}', '\u{28E8}', '\u{28F0}',
+    ],
+    // 5 dots — 62.5%
+    &[
+        '\u{281F}', '\u{282F}', '\u{2837}', '\u{283B}', '\u{283D}', '\u{283E}', '\u{284F}',
+        '\u{2857}', '\u{285B}', '\u{285D}', '\u{285E}', '\u{2867}', '\u{286B}', '\u{286D}',
+        '\u{286E}', '\u{2873}', '\u{2875}', '\u{2876}', '\u{2879}', '\u{287A}', '\u{287C}',
+        '\u{288F}', '\u{2897}', '\u{289B}', '\u{289D}', '\u{289E}', '\u{28A7}', '\u{28AB}',
+        '\u{28AD}', '\u{28AE}', '\u{28B3}', '\u{28B5}', '\u{28B6}', '\u{28B9}', '\u{28BA}',
+        '\u{28BC}', '\u{28C7}', '\u{28CB}', '\u{28CD}', '\u{28CE}', '\u{28D3}', '\u{28D5}',
+        '\u{28D6}', '\u{28D9}', '\u{28DA}', '\u{28DC}', '\u{28E3}', '\u{28E5}', '\u{28E6}',
+        '\u{28E9}', '\u{28EA}', '\u{28EC}', '\u{28F1}', '\u{28F2}', '\u{28F4}', '\u{28F8}',
+    ],
+    // 6 dots — 75%
+    &[
+        '\u{283F}', '\u{285F}', '\u{286F}', '\u{2877}', '\u{287B}', '\u{287D}', '\u{287E}',
+        '\u{289F}', '\u{28AF}', '\u{28B7}', '\u{28BB}', '\u{28BD}', '\u{28BE}', '\u{28CF}',
+        '\u{28D7}', '\u{28DB}', '\u{28DD}', '\u{28DE}', '\u{28E7}', '\u{28EB}', '\u{28ED}',
+        '\u{28EE}', '\u{28F3}', '\u{28F5}', '\u{28F6}', '\u{28F9}', '\u{28FA}', '\u{28FC}',
+    ],
+    // 7 dots — 87.5%
+    &[
+        '\u{287F}', '\u{28BF}', '\u{28DF}', '\u{28EF}', '\u{28F7}', '\u{28FB}', '\u{28FD}',
+        '\u{28FE}',
+    ],
+    // 8 dots — 100%
+    &['\u{28FF}'],
+];
+
+// ASCII fallback buckets for --compat/steady rendering (same bucketing).
+const BRAILLE_ASCII: &[char] = &[' ', ' ', '.', '.', ':', ':', '=', '=', '#'];
+
+/// Bucket index (0..8): nearest multiple of 12.5%, i.e. dots raised out of 8.
+fn braille_bucket(pct: f64) -> usize {
+    ((pct.clamp(0.0, 100.0) / 12.5).round() as usize).min(8)
+}
+
+/// SplitMix64 finalizer: stable per (second, cell) pseudo-random pick.
+fn mix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
+/// The eight braille dot bit values, for single-dot flickers.
+const DOT_BITS: [u32; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
+
+/// Two random glyphs from the core's dot-count bucket. Reseeded once per
+/// wall-clock second (via `second`), so the pair is stable across frames
+/// inside the same second even at sub-second refresh intervals.
+/// Sub-threshold idle cores (bucket 0) instead get a single dot at any of
+/// the 16 positions across the two glyphs with 20% chance per frame
+/// (`idle_frame` advances every redraw), so the grid keeps a little
+/// life when nothing is running.
+fn core_braille_glyphs(
+    pct: f64,
+    second: u64,
+    idle_frame: u64,
+    cell: usize,
+    seed: u64,
+) -> String {
+    let bucket = braille_bucket(pct);
+    let cell_seed = seed ^ ((cell as u64) << 40);
+    if bucket == 0 {
+        let fk = idle_frame.wrapping_mul(0xD6E8_FEB8_6659_FD93);
+        if mix64(cell_seed ^ fk ^ 0xB105) % 5 != 0 {
+            return "\u{2800}\u{2800}".to_string();
+        }
+        let pos = mix64(cell_seed ^ fk ^ 0x51D1) as usize % 16; // 16 dot slots: 8 per glyph
+        let glyph = 0x2800 + DOT_BITS[pos % 8];
+        let (left, right) = if pos < 8 { (glyph, 0x2800) } else { (0x2800, glyph) };
+        let ch = |v: u32| char::from_u32(v).unwrap_or('\u{2800}');
+        return format!("{}{}", ch(left), ch(right));
+    }
+    let glyphs = BRAILLE[bucket];
+    let pick = |k: u64| glyphs[mix64(cell_seed ^ (second << 20) ^ k) as usize % glyphs.len()];
+    format!("{}{}", pick(1), pick(2))
+}
+
+/// ASCII fallback pair for --compat/steady rendering: the bucket char plus
+/// the bucket below it (blank at 0%), mirroring the two-glyph braille cell.
+fn core_ascii_glyphs(pct: f64) -> String {
+    let bucket = braille_bucket(pct);
+    let lo = if bucket == 0 { ' ' } else { BRAILLE_ASCII[bucket - 1] };
+    format!("{}{}", BRAILLE_ASCII[bucket], lo)
+}
+
+/// Collapse per-core usage into grid rows (row-major, max 8 columns).
+/// When there are more cores than `GRID_CELLS`, cores are grouped and
+/// each cell shows the hottest core of its group.
+fn core_grid_cells(pcts: &[f64]) -> Vec<Vec<f64>> {
+    if pcts.is_empty() {
+        return Vec::new();
+    }
+    let group = (pcts.len() + GRID_CELLS - 1) / GRID_CELLS;
+    pcts
+        .chunks(group)
+        .map(|g| g.iter().cloned().fold(0f64, f64::max))
+        .collect::<Vec<f64>>()
+        .chunks(GRID_COLS)
+        .map(|r| r.to_vec())
+        .collect()
+}
+
 fn empty_bar_span(width: usize, steady: bool, truecolor: bool) -> Span<'static> {
     if steady || !truecolor {
         Span::raw(" ".repeat(width))
@@ -321,10 +476,11 @@ pub fn render(f: &mut Frame, state: &AppState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Fill(2),   // GPU
-            Constraint::Fill(2),   // mid row
+            Constraint::Length(13), // GPU
+            Constraint::Length(10), // mid row: net/cpu/mem are exactly 8 content lines
             Constraint::Length(3), // temps
-            Constraint::Fill(3),   // procs
+            Constraint::Length(((state.disks.len() + 2) / 3).max(1) as u16 + 2), // disks
+            Constraint::Min(5),    // procs: absorbs slack, shrinks first to a 2-row floor
             Constraint::Length(1), // status bar
         ])
         .split(area);
@@ -332,8 +488,9 @@ pub fn render(f: &mut Frame, state: &AppState) {
     render_gpu(f, with_margin(chunks[0]), state);
     render_mid_row(f, with_margin(chunks[1]), state);
     render_temps(f, with_margin(chunks[2]), state);
-    render_procs(f, with_margin(chunks[3]), state);
-    render_status_bar(f, with_margin(chunks[4]), state);
+    render_disks(f, with_margin(chunks[3]), state);
+    render_procs(f, with_margin(chunks[4]), state);
+    render_status_bar(f, with_margin(chunks[5]), state);
 }
 
 fn render_gpu(f: &mut Frame, area: Rect, state: &AppState) {
@@ -344,7 +501,7 @@ fn render_gpu(f: &mut Frame, area: Rect, state: &AppState) {
     if gpus.is_empty() {
         let block = styled_block("GPU", theme.gpu, truecolor);
         let text = Paragraph::new(
-            "No GPUs detected (install NVIDIA drivers for NVIDIA, or load amdgpu driver for AMD)",
+            "No GPUs detected (install NVIDIA drivers for NVIDIA, load amdgpu for AMD, or xe/i915 for Intel Arc)",
         )
         .style(muted_style(state.steady_render, truecolor))
         .block(block);
@@ -398,18 +555,32 @@ fn render_gpu(f: &mut Frame, area: Rect, state: &AppState) {
             "Util ",
             Style::default().add_modifier(Modifier::BOLD),
         )];
-        util_line.extend(util_bar);
-        util_line.push(Span::styled(
-            format!(" {:5.1}%", g.util),
-            Style::default().fg(display_color(uc, truecolor)),
-        ));
+        if g.has_util {
+            util_line.extend(util_bar);
+            util_line.push(Span::styled(
+                format!(" {:5.1}%", g.util),
+                Style::default().fg(display_color(uc, truecolor)),
+            ));
+        } else {
+            util_line.push(Span::styled(
+                "n/a",
+                muted_style(state.steady_render, truecolor),
+            ));
+        }
         lines.push(Line::from(util_line));
 
         // Util sparkline
-        lines.push(Line::from(Span::styled(
-            format!("     {}", spark_u),
-            Style::default().fg(display_color(uc, truecolor)),
-        )));
+        if g.has_util {
+            lines.push(Line::from(Span::styled(
+                format!("     {}", spark_u),
+                Style::default().fg(display_color(uc, truecolor)),
+            )));
+        } else {
+            lines.push(Line::from(Span::styled(
+                "     n/a",
+                muted_style(state.steady_render, truecolor),
+            )));
+        }
         lines.push(Line::from(""));
 
         // Mem line
@@ -417,36 +588,136 @@ fn render_gpu(f: &mut Frame, area: Rect, state: &AppState) {
             "Mem  ",
             Style::default().add_modifier(Modifier::BOLD),
         )];
-        mem_line.extend(mem_bar);
-        mem_line.push(Span::styled(
-            format!(" {:5.1}%", g.mem_pct),
-            Style::default().fg(display_color(mc, truecolor)),
-        ));
+        if g.has_mem {
+            mem_line.extend(mem_bar);
+            mem_line.push(Span::styled(
+                format!(" {:5.1}%", g.mem_pct),
+                Style::default().fg(display_color(mc, truecolor)),
+            ));
+        } else {
+            mem_line.push(Span::styled("n/a", muted_style(state.steady_render, truecolor)));
+        }
         lines.push(Line::from(mem_line));
 
         // Mem info
-        lines.push(Line::from(format!(
-            "     {:.1}/{:.1} GB",
-            g.mem_used_gb, g.mem_total_gb
-        )));
+        if g.has_mem {
+            lines.push(Line::from(format!(
+                "     {:.1}/{:.1} GB",
+                g.mem_used_gb, g.mem_total_gb
+            )));
+        } else if g.mem_total_gb > 0.0 {
+            lines.push(Line::from(Span::styled(
+                format!("     n/a / {:.1} GB", g.mem_total_gb),
+                muted_style(state.steady_render, truecolor),
+            )));
+        } else {
+            lines.push(Line::from(Span::styled(
+                "     n/a",
+                muted_style(state.steady_render, truecolor),
+            )));
+        }
 
         // Mem sparkline
-        lines.push(Line::from(Span::styled(
-            format!("     {}", spark_m),
-            Style::default().fg(display_color(mc, truecolor)),
-        )));
+        if g.has_mem {
+            lines.push(Line::from(Span::styled(
+                format!("     {}", spark_m),
+                Style::default().fg(display_color(mc, truecolor)),
+            )));
+        } else {
+            lines.push(Line::from(Span::styled(
+                "     n/a",
+                muted_style(state.steady_render, truecolor),
+            )));
+        }
 
-        let name_short = g
-            .name
-            .replace("NVIDIA ", "")
-            .replace("AMD ", "")
-            .replace("Advanced Micro Devices, Inc. ", "")
-            .replace(" Generation", "");
+        lines.push(Line::from(""));
+
+        // Pwr: live watts bar + history sparkline (per-GPU, grouped with
+        // Util/Mem in the same column).
+        let watts = state.gpu_power.get(i).copied().flatten();
+        let phist = state.gpu_power_hist.get(&g.id);
+        // Scale the bar to the card's power limit when the driver exposes
+        // one; fallback: observed peak with a 100 W floor.
+        let pscale = g.power_limit_w.unwrap_or_else(|| {
+            phist
+                .map(|h| h.iter().cloned().fold(0f64, f64::max))
+                .unwrap_or(0.0)
+        }).max(100.0);
+        let ppct = watts
+            .map(|w| (w / pscale * 100.0).clamp(0.0, 100.0))
+            .unwrap_or(0.0);
+        let pc = color_for_pct(ppct, theme);
+        let pw = if g.power_limit_w.is_some() {
+            bar_w.saturating_sub(6).max(5)
+        } else {
+            bar_w
+        };
+        let mut pwr_line = vec![Span::styled(
+            "Pwr  ",
+            Style::default().add_modifier(Modifier::BOLD),
+        )];
+        if let Some(w) = watts {
+            pwr_line.extend(bar_spans(ppct, pw, theme, state.steady_render, truecolor));
+            pwr_line.push(Span::styled(
+                match g.power_limit_w {
+                    Some(lim) => format!(" {:5.1}/{:4.0} W", w, lim),
+                    None => format!(" {:6.1} W", w),
+                },
+                Style::default().fg(display_color(pc, truecolor)),
+            ));
+            lines.push(Line::from(pwr_line));
+            let pspark = if state.steady_render {
+                String::new()
+            } else {
+                phist
+                    .map(|h| {
+                        let pct: std::collections::VecDeque<f64> = h
+                            .iter()
+                            .map(|w| (w / pscale * 100.0).clamp(0.0, 100.0))
+                            .collect();
+                        sparkline(&pct, spark_w)
+                    })
+                    .unwrap_or_default()
+            };
+            lines.push(Line::from(Span::styled(
+                format!("     {}", pspark),
+                Style::default().fg(display_color(pc, truecolor)),
+            )));
+        } else {
+            pwr_line.push(Span::styled("n/a", muted_style(state.steady_render, truecolor)));
+            lines.push(Line::from(pwr_line));
+            lines.push(Line::from(Span::styled(
+                "     n/a",
+                muted_style(state.steady_render, truecolor),
+            )));
+        }
+        lines.push(Line::from(""));
+
+        // PCIe link: live trained speed/width (sysfs, same source as
+        // nvtop); device max shown only when running below it.
+        if let Some(p) = &g.pci {
+            let cg = pci_gen(&p.cur_speed);
+            let mg = pci_gen(&p.max_speed);
+            let mut txt = format!("PCIe {} x{}", cg, p.cur_width);
+            if p.cur_width < p.max_width || cg != mg {
+                txt.push_str(&format!(" (max {} x{})", mg, p.max_width));
+            }
+            if let (Some(rx), Some(tx)) = (g.pcie_rx_kbs, g.pcie_tx_kbs) {
+                txt.push_str(&format!(
+                    "  ↓{:5.1} ↑{:5.1} MB/s",
+                    rx / 1024.0,
+                    tx / 1024.0
+                ));
+            }
+            lines.push(Line::from(Span::styled(txt, Style::default())));
+        }
+
+        let name_short = gpu_name_short(&g.name);
 
         let block = styled_block(&format!("GPU {}", g.id), theme.gpu, truecolor).title_bottom(
             Line::from(Span::styled(
                 format!(" {} ", name_short),
-                muted_style(state.steady_render, truecolor),
+                Style::default().fg(display_color(theme.gpu, truecolor)),
             )),
         );
 
@@ -454,6 +725,35 @@ fn render_gpu(f: &mut Frame, area: Rect, state: &AppState) {
         f.render_widget(paragraph, gpu_chunks[i]);
     }
 }
+
+fn gpu_name_short(name: &str) -> String {
+    name.replace("Advanced Micro Devices, Inc. ", "AMD ")
+        .replace(" Generation", "")
+}
+
+// "16.0 GT/s PCIe" -> "G4"
+fn pci_gen(speed: &str) -> String {
+    let v: f64 = speed
+        .split_whitespace()
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
+    let g = if v >= 64.0 {
+        6
+    } else if v >= 32.0 {
+        5
+    } else if v >= 16.0 {
+        4
+    } else if v >= 8.0 {
+        3
+    } else if v >= 5.0 {
+        2
+    } else {
+        1
+    };
+    format!("G{}", g)
+}
+
 
 fn render_mid_row(f: &mut Frame, area: Rect, state: &AppState) {
     let chunks = Layout::default()
@@ -499,18 +799,6 @@ fn render_cpu(f: &mut Frame, area: Rect, state: &AppState) {
     lines.push(Line::from(overall));
 
     lines.push(Line::from(Span::styled(
-        format!(
-            "Cores: {}  Total: {:.0}%  Freq: {}",
-            state.cpu_cores, state.cpu_total_pct, state.cpu_freq
-        ),
-        muted_style(state.steady_render, truecolor),
-    )));
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "History",
-        Style::default().add_modifier(Modifier::BOLD),
-    )));
-    lines.push(Line::from(Span::styled(
         format!("         {}", spark_top),
         Style::default().fg(display_color(c, truecolor)),
     )));
@@ -518,8 +806,80 @@ fn render_cpu(f: &mut Frame, area: Rect, state: &AppState) {
         format!("         {}", spark_bot),
         Style::default().fg(display_color(c, truecolor)),
     )));
+    lines.push(Line::from(""));
+    // Per-core braille grid: two random glyphs per core from the dot-count
+    // bucket matching the core's usage (8 columns, max 4 rows), colored with
+    // the smooth bar gradient, with cores/total/freq/power readouts down the
+    // right side. The whole block is centered when the panel is wide enough
+    // for it; otherwise the grid is clipped column-by-column so the readouts
+    // still show.
+    let grid = core_grid_cells(&state.cpu_core_pcts);
+    if !grid.is_empty() {
+        // Glyph pairs are re-rolled once per wall-clock second, staying
+        // stable across every frame drawn inside the same second.
+        let glyph_second = state.render_base.elapsed().as_secs();
+        // Monotonic draw-frame counter for the idle-core dot flicker.
+        let idle_frame = (state.render_base.elapsed().as_secs_f64() / state.refresh_secs.max(0.01)) as u64;
+        let mut cell_idx = 0usize;
+        let (cores_sym, total_sym, freq_sym, power_sym) = if state.steady_render {
+            ("C", "T", "F", "P")
+        } else {
+            ("\u{229E}", "\u{3A3}", "\u{192}", "\u{2301}")
+        };
+        let info = [
+            format!("{cores_sym}: {}", state.cpu_cores),
+            format!("{total_sym}: {:.0}%", state.cpu_total_pct),
+            format!("{freq_sym}: {}", state.cpu_freq),
+            match state.cpu_power_watts {
+                Some(w) => format!("{power_sym}: {:.0} W", w),
+                None if state.cpu_power_denied => format!("{power_sym}: SU req"),
+                None => format!("{power_sym}: n/a"),
+            },
+        ];
+        let label_w = info.iter().map(|s| s.chars().count()).max().unwrap_or(0);
+        let inner_w = area.width.saturating_sub(2) as usize;
+        let block_w = GRID_COLS * 2 + 2 + label_w;
+        let pad = inner_w.saturating_sub(block_w) / 2;
+        let shown_w = if pad > 0 {
+            GRID_COLS * 2
+        } else {
+            let avail = inner_w.saturating_sub(2 + label_w);
+            (avail / 2).min(GRID_COLS) * 2
+        };
+        let max_cells = shown_w / 2;
+        for i in 0..4 {
+            let mut spans = Vec::new();
+            if pad > 0 {
+                spans.push(Span::raw(" ".repeat(pad)));
+            }
+            let mut grid_w = 0usize;
+            if let Some(row) = grid.get(i) {
+                for v in row.iter().take(max_cells) {
+                    let pair = if state.steady_render {
+                        core_ascii_glyphs(*v)
+                    } else {
+                        core_braille_glyphs(*v, glyph_second, idle_frame, cell_idx, state.rand_base)
+                    };
+                    spans.push(Span::styled(
+                        pair,
+                        Style::default()
+                            .fg(display_color(lerp_color(theme.bar_low, theme.bar_high, v / 100.0), truecolor)),
+                    ));
+                    grid_w += 2;
+                    cell_idx += 1;
+                }
+            }
+            spans.push(Span::raw(" ".repeat(shown_w - grid_w + 2)));
+            spans.push(Span::styled(info[i].clone(), white_style(truecolor)));
+            lines.push(Line::from(spans));
+        }
+    }
 
-    let block = styled_block("CPU", theme.cpu, truecolor);
+    let block =
+        styled_block("CPU", theme.cpu, truecolor).title_bottom(Line::from(Span::styled(
+            format!(" {} ", state.cpu_name),
+            Style::default().fg(display_color(theme.cpu, truecolor)),
+        )));
 
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
@@ -578,6 +938,10 @@ fn render_net(f: &mut Frame, area: Rect, state: &AppState) {
         Style::default().fg(display_color(theme.net_up, truecolor)),
     ));
     lines.push(Line::from(up_line));
+    lines.push(Line::from(Span::styled(
+        format!("Peak Up: {}", fmt_speed(state.net_max_up)),
+        white_style(truecolor),
+    )));
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         format!("     {}", spark_up_str),
@@ -599,10 +963,9 @@ fn render_net(f: &mut Frame, area: Rect, state: &AppState) {
         Style::default().fg(display_color(theme.net_down, truecolor)),
     ));
     lines.push(Line::from(down_line));
-    lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        format!("Peak: {}", fmt_speed(mx)),
-        muted_style(state.steady_render, truecolor),
+        format!("Peak Down: {}", fmt_speed(state.net_max_down)),
+        white_style(truecolor),
     )));
 
     let block = styled_block("Network", theme.net, truecolor);
@@ -635,11 +998,34 @@ fn render_mem(f: &mut Frame, area: Rect, state: &AppState) {
     ));
     lines.push(Line::from(ram_line));
     lines.push(Line::from(format!(
-        "  {} used / {}",
+        "  {} used / {} total",
         fmt_bytes(state.ram_used as f64),
         fmt_bytes(state.ram_total as f64)
     )));
-    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        format!(
+            "  {} avail / {} cached",
+            fmt_bytes(state.ram_available as f64),
+            fmt_bytes(state.ram_cached as f64)
+        ),
+        white_style(truecolor),
+    )));
+    if let Some((committed, limit)) = state.mem_committed {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  {} committed / {} limit",
+                fmt_bytes(committed as f64),
+                fmt_bytes(limit as f64)
+            ),
+            white_style(truecolor),
+        )));
+    }
+    if let Some((p10, p60, p300)) = state.mem_psi_some {
+        lines.push(Line::from(Span::styled(
+            format!("  PSI some {:.1}/{:.1}/{:.1}%", p10, p60, p300),
+            white_style(truecolor),
+        )));
+    }
 
     let mut swap_line = vec![Span::styled(
         "Swap ",
@@ -648,25 +1034,27 @@ fn render_mem(f: &mut Frame, area: Rect, state: &AppState) {
     swap_line.extend(swap_bar);
     swap_line.push(Span::styled(
         format!(" {:5.1}%", swap_pct),
-        muted_style(state.steady_render, truecolor),
+        Style::default().fg(display_color(color_for_pct(swap_pct, theme), truecolor)),
     ));
     lines.push(Line::from(swap_line));
     lines.push(Line::from(Span::styled(
         format!(
-            "  {} used / {}",
+            "  {} used / {} total",
             fmt_bytes(state.swap_used as f64),
             fmt_bytes(state.swap_total as f64)
         ),
-        muted_style(state.steady_render, truecolor),
+        white_style(truecolor),
     )));
-    lines.push(Line::from(Span::styled(
-        format!(
-            "  {} avail  Cache: {}",
-            fmt_bytes(state.ram_available as f64),
-            fmt_bytes(state.ram_cached as f64)
-        ),
-        muted_style(state.steady_render, truecolor),
-    )));
+    let mut swap_io_line = Vec::new();
+    swap_io_line.push(Span::styled(
+        format!("  R {:>9}", fmt_speed(state.swap_io_read)),
+        Style::default().fg(display_color(theme.net_down, truecolor)),
+    ));
+    swap_io_line.push(Span::styled(
+        format!("  W {:>9}", fmt_speed(state.swap_io_write)),
+        Style::default().fg(display_color(theme.net_up, truecolor)),
+    ));
+    lines.push(Line::from(swap_io_line));
 
     let block = styled_block("Memory", theme.mem, truecolor);
 
@@ -750,6 +1138,56 @@ fn render_temps(f: &mut Frame, area: Rect, state: &AppState) {
             f.render_widget(Paragraph::new(vec![line]), temp_cols[i]);
         }
     }
+}
+
+fn render_disks(f: &mut Frame, area: Rect, state: &AppState) {
+    let theme = &state.theme;
+    let truecolor = truecolor_enabled(state);
+    let block = styled_block("Disks", theme.bar_mid, truecolor);
+
+    if state.disks.is_empty() {
+        f.render_widget(
+            Paragraph::new("No disks detected")
+                .style(muted_style(state.steady_render, truecolor))
+                .block(block),
+            area,
+        );
+        return;
+    }
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    // Three columns of disks per row, NVMe first (sorted in the tracker).
+    let cell_w = (inner.width as usize) / 3;
+    let lines: Vec<Line> = state
+        .disks
+        .chunks(3)
+        .map(|row| {
+            let mut spans = Vec::new();
+            for d in row {
+                let mut cell = vec![Span::styled(
+                    format!("{:<10}", d.name),
+                    Style::default().add_modifier(Modifier::BOLD),
+                )];
+                cell.push(Span::styled(
+                    format!("R {:>9}  ", fmt_speed(d.read_bps)),
+                    Style::default().fg(display_color(theme.net_down, truecolor)),
+                ));
+                cell.push(Span::styled(
+                    format!("W {:>9}", fmt_speed(d.write_bps)),
+                    Style::default().fg(display_color(theme.net_up, truecolor)),
+                ));
+                let used: usize = cell.iter().map(|s| s.content.chars().count()).sum();
+                if cell_w > used {
+                    cell.push(Span::raw(" ".repeat(cell_w - used)));
+                }
+                spans.extend(cell);
+            }
+            Line::from(spans)
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn temp_cell(
@@ -1128,4 +1566,142 @@ fn render_theme_picker(f: &mut Frame, state: &AppState) {
         Span::raw(" Cancel"),
     ]);
     f.render_widget(Paragraph::new(hint), chunks[2]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{braille_bucket, core_ascii_glyphs, core_braille_glyphs, core_grid_cells, BRAILLE};
+
+    #[test]
+    fn lays_out_thirty_two_cores_as_four_rows_of_eight() {
+        let pcts: Vec<f64> = (0..32).map(|i| i as f64).collect();
+        let rows = core_grid_cells(&pcts);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0], vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+        assert_eq!(rows[3][7], 31.0);
+    }
+
+    #[test]
+    fn groups_beyond_thirty_two_cores_by_max() {
+        // 40 cores -> groups of 2 -> 20 cells -> 3 rows; core 37 pegged
+        let mut pcts = vec![10.0; 40];
+        pcts[37] = 100.0;
+        let rows = core_grid_cells(&pcts);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[2][2], 100.0); // cell 18 = row 2, col 2
+        assert_eq!(rows[0][0], 10.0);
+    }
+
+    #[test]
+    fn short_core_counts_use_partial_rows() {
+        let rows = core_grid_cells(&[5.0, 90.0, 40.0]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], vec![5.0, 90.0, 40.0]);
+    }
+
+    #[test]
+    fn braille_tables_cover_every_braille_glyph_exactly_once() {
+        let mut seen = [0u32; 256];
+        for (bucket, glyphs) in BRAILLE.iter().enumerate() {
+            for &g in glyphs.iter() {
+                let idx = g as u32 - 0x2800;
+                assert!(idx < 256, "glyph outside U+2800..U+28FF: {g:?}");
+                seen[idx as usize] += 1;
+                let dots = (idx as u8).count_ones() as usize;
+                assert_eq!(dots, bucket, "{g:?} has {dots} dots but sits in bucket {bucket}");
+            }
+        }
+        for (idx, &count) in seen.iter().enumerate() {
+            assert_eq!(count, 1, "U+{:04X} appears {count} times in BRAILLE tables", idx + 0x2800);
+        }
+    }
+
+    #[test]
+    fn braille_bucket_rounds_usage_to_nearest_eighth() {
+        assert_eq!(braille_bucket(0.0), 0);
+        assert_eq!(braille_bucket(6.2), 0);
+        assert_eq!(braille_bucket(6.3), 1);
+        assert_eq!(braille_bucket(37.5), 3);
+        assert_eq!(braille_bucket(50.0), 4);
+        assert_eq!(braille_bucket(87.5), 7);
+        assert_eq!(braille_bucket(93.8), 8);
+        assert_eq!(braille_bucket(100.0), 8);
+        assert_eq!(braille_bucket(-10.0), 0);
+        assert_eq!(braille_bucket(500.0), 8);
+    }
+
+    #[test]
+    fn core_glyph_pair_is_two_chars_from_the_usage_bucket() {
+        for pct in [12.0, 25.0, 37.5, 50.0, 62.5, 75.0, 88.0, 100.0] {
+            let pair = core_braille_glyphs(pct, 7, 0, 3, 0xA5A5);
+            let chars: Vec<char> = pair.chars().collect();
+            assert_eq!(chars.len(), 2, "pair must occupy two cells: {pair:?}");
+            let dots = braille_bucket(pct);
+            for c in chars {
+                assert!((c as u32) >= 0x2800 && (c as u32) <= 0x28FF, "out of block: {c:?}");
+                assert_eq!(((c as u32 - 0x2800) as u8).count_ones() as usize, dots, "{c:?} not in bucket for {pct}% usage");
+            }
+        }
+    }
+
+    #[test]
+    fn idle_core_flickers_one_dot_across_the_two_glyphs() {
+        let mut lit = 0;
+        let mut positions = [false; 16];
+        let mut on_left = false;
+        let mut on_right = false;
+        for frame in 0..2000u64 {
+            let pair = core_braille_glyphs(0.0, 3, frame, 7, 0xBEEF);
+            let chars: Vec<char> = pair.chars().collect();
+            assert_eq!(chars.len(), 2);
+            let bits: Vec<u32> = chars.iter().map(|c| *c as u32 - 0x2800).collect();
+            let total: u32 = bits.iter().map(|b| b.count_ones()).sum();
+            assert!(total <= 1, "idle flicker must show at most one dot: {pair:?}");
+            if total == 0 {
+                assert_eq!(pair, "\u{2800}\u{2800}");
+            } else {
+                lit += 1;
+                let (idx, b) = if bits[0] != 0 { (0, bits[0]) } else { (1, bits[1]) };
+                assert_eq!(b.count_ones(), 1);
+                on_left |= idx == 0;
+                on_right |= idx == 1;
+                let dot = b.trailing_zeros() as usize; // 8 dot bits
+                positions[idx * 8 + dot] = true;
+            }
+        }
+        assert!((300..500).contains(&lit), "lit frames {lit}/2000, expected ~20%");
+        assert!(on_left && on_right, "dot must land on both glyphs");
+        assert!(positions.iter().all(|&p| p), "all 16 dot positions must appear");
+    }
+
+    #[test]
+    fn idle_flicker_is_deterministic_per_frame() {
+        assert_eq!(
+            core_braille_glyphs(0.0, 3, 42, 7, 0xBEEF),
+            core_braille_glyphs(0.0, 3, 42, 7, 0xBEEF)
+        );
+    }
+
+    #[test]
+    fn glyph_pair_is_stable_within_a_second_and_rerolls_across_seconds() {
+        let a = core_braille_glyphs(50.0, 100, 0, 5, 0x1234);
+        let b = core_braille_glyphs(50.0, 100, 0, 5, 0x1234);
+        assert_eq!(a, b);
+        let mut rerolled = false;
+        for s in 101..140 {
+            if core_braille_glyphs(50.0, s, 0, 5, 0x1234) != a {
+                rerolled = true;
+                break;
+            }
+        }
+        assert!(rerolled, "glyphs never re-roll across seconds");
+    }
+
+    #[test]
+    fn ascii_fallback_pairs_use_the_bucket_and_the_one_below() {
+        assert_eq!(core_ascii_glyphs(0.0), "  ");
+        assert_eq!(core_ascii_glyphs(25.0), ". ");
+        assert_eq!(core_ascii_glyphs(100.0), "#=");
+        assert_eq!(core_ascii_glyphs(50.0), ":.");
+    }
 }
