@@ -87,8 +87,17 @@ ktop -r 2
 # Start with a specific theme
 ktop --theme "Tokyo Night"
 
-# Simulation mode (fake OOM kills, profiling to /tmp/ktop_profile.log)
+# Simulation mode (fake OOM kills in the status bar)
 ktop --sim
+
+# Draw in the current screen instead of the alternate screen
+ktop --no-alt-screen
+
+# Disable synchronized (atomic) terminal redraws
+ktop --no-sync
+
+# Skip the background GitHub update check at startup
+ktop --no-update-check
 
 # Remote terminal fallback if the display flashes
 ktop --compat
@@ -106,6 +115,8 @@ ktop --version
 ktop update
 ktop uninstall
 ```
+
+Environment variables (all accept `1`/`true`/`yes`/`on`): `KTOP_COMPAT`, `KTOP_NO_ALT_SCREEN`, `KTOP_NO_SYNC`, `KTOP_NO_UPDATE_CHECK` — equivalents of `--compat`, `--no-alt-screen`, `--no-sync`, and `--no-update-check`.
 
 ### Keybindings
 

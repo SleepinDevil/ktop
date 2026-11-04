@@ -39,6 +39,7 @@ fn main() {
     let mut no_alt_screen = env_flag("KTOP_NO_ALT_SCREEN");
     let mut no_sync = env_flag("KTOP_NO_SYNC");
     let mut compat = env_flag("KTOP_COMPAT");
+    let mut no_update_check = env_flag("KTOP_NO_UPDATE_CHECK");
 
     let args: Vec<String> = env::args().collect();
     if let Some(command) = args.get(1).map(String::as_str) {
@@ -130,6 +131,9 @@ fn main() {
             "--compat" => {
                 compat = true;
             }
+            "--no-update-check" => {
+                no_update_check = true;
+            }
             other if other.starts_with('-') => {
                 exit_usage_error(format!("unknown option '{}'", other));
             }
@@ -146,7 +150,15 @@ fn main() {
         }
     }
 
-    if let Err(e) = app::run(refresh, sim, theme_override, no_alt_screen, no_sync, compat) {
+    if let Err(e) = app::run(
+        refresh,
+        sim,
+        theme_override,
+        no_alt_screen,
+        no_sync,
+        compat,
+        !no_update_check,
+    ) {
         eprintln!("Error: {}", e);
         std::process::exit(1);
     }
@@ -201,12 +213,13 @@ fn print_main_help() {
     println!("  --no-alt-screen        Draw in the current terminal screen");
     println!("  --no-sync              Disable synchronized terminal redraws");
     println!("  --compat               Use conservative remote-terminal drawing");
+    println!("  --no-update-check      Skip the background release check at startup");
     println!("  -h, --help             Print help");
     println!();
     println!("Commands:");
     println!("  diagnose-terminal      Report terminal size and resize behavior");
     println!("  diagnose-render        Run visual terminal repaint isolation tests");
-    println!("  update                 Run the official one-line update installer");
+    println!("  update                 Run the one-line update installer from the README");
     println!("  uninstall              Remove this ktop executable");
 }
 
@@ -219,7 +232,7 @@ fn exit_usage_error(message: impl AsRef<str>) -> ! {
 fn print_update_help() {
     println!("ktop update");
     println!();
-    println!("Runs the official one-line installer from the README:");
+    println!("Runs the one-line installer from the README:");
     println!("  curl -sSfL {} | bash", INSTALL_SCRIPT_URL);
 }
 

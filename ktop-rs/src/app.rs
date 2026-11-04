@@ -159,6 +159,7 @@ fn ansi_palette_code(background: bool, n: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::rewrite_sgr;
+    use super::{parse_tag_version, tag_name_from_json, version_is_newer};
     use super::{ProfBlock, Profiler};
 
     #[test]
@@ -242,6 +243,35 @@ mod tests {
         p.add(ProfBlock::Total, 7.0);
         assert_eq!(p.samples(), 10);
         assert_eq!(p.stats(ProfBlock::Total).last_us, 7.0);
+    }
+
+    #[test]
+    fn tag_versions_order_numerically_not_lexically() {
+        assert_eq!(parse_tag_version("v1.0.10"), Some((1, 0, 10)));
+        assert_eq!(parse_tag_version("1.0.10"), Some((1, 0, 10)));
+        // Missing components are zero; more than three parts is uncomparable.
+        assert_eq!(parse_tag_version("v2.1"), Some((2, 1, 0)));
+        assert_eq!(parse_tag_version("v1.0.0.1"), None);
+        assert_eq!(parse_tag_version("v1.0.beta"), None);
+        assert_eq!(parse_tag_version(""), None);
+        // 1.0.10 > 1.0.9 numerically; equal and unparseable are never newer.
+        assert!(version_is_newer("v1.0.10", "1.0.9"));
+        assert!(!version_is_newer("v1.0.9", "1.0.10"));
+        assert!(!version_is_newer("v1.0.0", "1.0.0"));
+        assert!(version_is_newer("v2.0.0", "v1.99.99"));
+        assert!(!version_is_newer("nightly", "1.0.0"));
+    }
+
+    #[test]
+    fn tag_name_is_extracted_from_api_json() {
+        // The releases API serves pretty-printed bodies — space after the
+        // colon and newlines before the value — and compact ones too.
+        let pretty = "{\n  \"url\": \"https://x/y\",\n  \"tag_name\": \"v1.2.3\",\n  \"draft\": false\n}";
+        assert_eq!(tag_name_from_json(pretty), Some("v1.2.3"));
+        let compact = r#"{"url":"https://x/y","tag_name":"v1.2.3","draft":false}"#;
+        assert_eq!(tag_name_from_json(compact), Some("v1.2.3"));
+        assert_eq!(tag_name_from_json(r#"{"message":"Not Found"}"#), None);
+        assert_eq!(tag_name_from_json(""), None);
     }
 }
 
@@ -328,6 +358,102 @@ pub struct AppState {
     // In-process performance profile of the sampling loop (shown with `p`).
     pub prof: Profiler,
     pub show_stats: bool,
+    // Set when the background startup check found a release on the fork's
+    // GitHub releases page that is newer than the compiled-in version.
+    pub update_available: bool,
+}
+
+// ── Update check ──
+// One-shot background release check at startup. The event loop is fully
+// synchronous, so the network round-trip runs on a detached worker thread
+// that shells out to `curl` (same trade the installer makes — no HTTP crate)
+// and publishes a single bool through a mutex mailbox. The loop takes the
+// result exactly once with a non-blocking read; a check that fails, times
+// out, or is disabled shows nothing anywhere. The worker compares against
+// `env!("CARGO_PKG_VERSION")`, so the version baked into the binary at
+// build time is the comparison base — cutting a release without bumping
+// Cargo.toml makes this check unable to fire correctly (see AGENTS.md).
+
+const UPDATE_CHECK_URL: &str = "https://api.github.com/repos/SleepinDevil/ktop/releases/latest";
+
+/// Parse `"v1.2.3"` (leading `v` optional, trailing components optional)
+/// into its numeric triple for ordering. Any non-numeric part or more than
+/// three components makes the tag uncomparable.
+fn parse_tag_version(tag: &str) -> Option<(u64, u64, u64)> {
+    let core = tag.strip_prefix('v').unwrap_or(tag);
+    let mut parts = [0u64; 3];
+    let mut seen = 0;
+    for p in core.split('.') {
+        if seen == 3 {
+            return None;
+        }
+        parts[seen] = p.parse().ok()?;
+        seen += 1;
+    }
+    if seen == 0 {
+        return None;
+    }
+    Some((parts[0], parts[1], parts[2]))
+}
+
+/// Extract the `"tag_name"` string from the GitHub releases API JSON body.
+/// Hand-rolled like everything else here (no JSON crate); the API serves
+/// pretty-printed bodies (space after the colon), so tolerate whitespace
+/// between key, colon, and the opening quote.
+fn tag_name_from_json(body: &str) -> Option<&str> {
+    let at = body.find("\"tag_name\"")?;
+    let rest = body[at + "\"tag_name\"".len()..].trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start();
+    let value = rest.strip_prefix('"')?;
+    let end = value.find('"')?;
+    Some(&value[..end])
+}
+
+/// True when `latest` orders above the compiled-in `current` version;
+/// anything unparseable is never treated as newer.
+fn version_is_newer(latest: &str, current: &str) -> bool {
+    match (parse_tag_version(latest), parse_tag_version(current)) {
+        (Some(a), Some(b)) => a > b,
+        _ => false,
+    }
+}
+
+/// One `curl` round-trip: is the fork's latest release newer than `current`?
+/// Every failure mode (no curl, offline, API error, odd body) is "no".
+fn fetch_latest_release_newer(current: &str) -> bool {
+    let Ok(out) = std::process::Command::new("curl")
+        .args(["-sSf", "--connect-timeout", "3", "--max-time", "8"])
+        .arg(UPDATE_CHECK_URL)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    let body = String::from_utf8_lossy(&out.stdout);
+    match tag_name_from_json(&body) {
+        Some(tag) => version_is_newer(tag, current),
+        None => false,
+    }
+}
+
+/// Spawn the detached worker. The returned mailbox is `None` while the
+/// check is in flight, then `Some(newer)` exactly once. If ktop exits first
+/// the process teardown takes the thread and its child `curl` with it.
+fn spawn_update_check() -> std::sync::Arc<std::sync::Mutex<Option<bool>>> {
+    let done: std::sync::Arc<std::sync::Mutex<Option<bool>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let slot = std::sync::Arc::clone(&done);
+    std::thread::spawn(move || {
+        let newer = fetch_latest_release_newer(env!("CARGO_PKG_VERSION"));
+        if let Ok(mut guard) = slot.lock() {
+            *guard = Some(newer);
+        }
+    });
+    done
 }
 
 // ── Performance profile ──
@@ -557,6 +683,7 @@ pub fn run(
     no_alt_screen: bool,
     no_sync: bool,
     compat: bool,
+    update_check: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Init system (CPU only — memory comes from a direct /proc/meminfo read)
     let mut sys = System::new_with_specifics(
@@ -686,6 +813,15 @@ pub fn run(
         refresh_secs: refresh,
         prof: Profiler::new(),
         show_stats: false,
+        update_available: false,
+    };
+
+    // Fire the one-shot release check off-thread before the first draw so
+    // it overlaps the startup sampling; the loop collects its result.
+    let mut update_check = if update_check {
+        Some(spawn_update_check())
+    } else {
+        None
     };
 
     let refresh_dur = Duration::from_secs_f64(refresh);
@@ -696,6 +832,16 @@ pub fn run(
 
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
         loop {
+            // Non-blocking collect of the background release check: once the
+            // worker is done, land its verdict and drop the mailbox.
+            let verdict = update_check
+                .as_ref()
+                .and_then(|c| c.lock().ok().and_then(|mut g| g.take()));
+            if let Some(newer) = verdict {
+                state.update_available = newer;
+                update_check = None;
+            }
+
             let now = Instant::now();
 
             // Wake exactly when there is work: the next refresh tick, or —

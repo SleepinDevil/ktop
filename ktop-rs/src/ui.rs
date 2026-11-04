@@ -988,7 +988,7 @@ fn render_mem(f: &mut Frame, area: Rect, state: &AppState) {
     if let Some((committed, limit)) = state.mem_committed {
         lines.push(Line::from(Span::styled(
             format!(
-                "  {} committed / {} limit",
+                "  {} comitd / {} limit",
                 fmt_bytes(committed as f64),
                 fmt_bytes(limit as f64)
             ),
@@ -1365,7 +1365,16 @@ fn render_status_bar(f: &mut Frame, area: Rect, state: &AppState) {
     } else {
         "░ No OOM kills".to_string()
     };
-    let right_len = power_text.len() + oom_text.len();
+    // Verified-newer-release notice: a separate right-hand segment ahead of
+    // PWR, separated from it by a vertical bar. Absent until (and unless)
+    // the background check confirms a newer release. The styled spans below
+    // must reproduce `update_text` exactly — it sizes the segment.
+    let update_text = if state.update_available {
+        format!("v{} | Update available │ ", env!("CARGO_PKG_VERSION"))
+    } else {
+        String::new()
+    };
+    let right_len = power_text.len() + oom_text.len() + update_text.len();
     let right_width = right_len.min(area.width as usize) as u16;
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -1374,7 +1383,30 @@ fn render_status_bar(f: &mut Frame, area: Rect, state: &AppState) {
 
     f.render_widget(Paragraph::new(Line::from(left_spans)), chunks[0]);
 
+    // Verified-newer-release notice: a separate right-hand segment ahead of
+    // PWR, separated from it by a vertical bar. Absent until (and unless)
+    // the background check confirms a newer release.
     let mut right_spans = Vec::new();
+    if state.update_available {
+        right_spans.push(Span::styled(
+            format!("v{} ", env!("CARGO_PKG_VERSION")),
+            muted_style(state.steady_render, truecolor),
+        ));
+        right_spans.push(Span::styled(
+            "| ",
+            muted_style(state.steady_render, truecolor),
+        ));
+        right_spans.push(Span::styled(
+            "Update available ",
+            Style::default()
+                .fg(display_color(theme.bar_high, truecolor))
+                .add_modifier(Modifier::BOLD),
+        ));
+        right_spans.push(Span::styled(
+            "│ ",
+            muted_style(state.steady_render, truecolor),
+        ));
+    }
     match state.est_power_watts {
         Some(power) => right_spans.push(Span::styled(
             format!("PWR ~{}W  ", power.round() as u64),
