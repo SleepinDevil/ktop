@@ -1,6 +1,6 @@
 # ktop
 
-![ktop screenshot](screenshot.png?v=6fadd5e)
+![ktop screenshot](screenshot.png?v=c880be1)
 
 A terminal-based system resource monitor built for tracking resource usage when running hybrid LLM workloads.
 
