@@ -1,9 +1,9 @@
-use crate::app::AppState;
+use crate::app::{AppState, ProfBlock, ProfStats, PROF_BLOCKS};
 use crate::theme::Theme;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table};
+use ratatui::widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table, Widget};
 use ratatui::Frame;
 use std::collections::VecDeque;
 
@@ -479,6 +479,9 @@ pub fn render(f: &mut Frame, state: &AppState) {
     render_disks(f, with_margin(chunks[3]), state);
     render_procs(f, with_margin(chunks[4]), state);
     render_status_bar(f, with_margin(chunks[5]), state);
+    if state.show_stats {
+        render_stats(f, state);
+    }
 }
 
 fn render_gpu(f: &mut Frame, area: Rect, state: &AppState) {
@@ -1330,6 +1333,13 @@ fn render_status_bar(f: &mut Frame, area: Rect, state: &AppState) {
         ),
         Span::styled(" Theme  ", muted_style(state.steady_render, truecolor)),
         Span::styled(
+            " s",
+            Style::default()
+                .fg(display_color(theme.proc_cpu, truecolor))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" Stats  ", muted_style(state.steady_render, truecolor)),
+        Span::styled(
             " c",
             Style::default()
                 .fg(display_color(theme.net, truecolor))
@@ -1395,6 +1405,130 @@ fn render_status_bar(f: &mut Frame, area: Rect, state: &AppState) {
         Paragraph::new(Line::from(right_spans)).alignment(Alignment::Right),
         chunks[1],
     );
+}
+
+// ── Performance stats ──
+
+/// Microseconds spelled the way the diagnostics table reads them.
+fn format_us(us: f64) -> String {
+    if us >= 1000.0 {
+        format!("{:.2} ms", us / 1000.0)
+    } else {
+        format!("{:.1} us", us)
+    }
+}
+
+/// Diagnostic page for the sampling loop itself (`s`): per-tick last/avg/max
+/// wall duration of every block of the refresh tick, and the process's own
+/// CPU time per tick in the header — what a %CPU column would show for the
+/// same window. The profiler runs always, so these are retrospective —
+/// exactly what the loop cost before the page was opened. Wall durations
+/// exceed CPU time when the loop waits in a device driver (GPU queries);
+/// both are true statements about different things, so both are shown.
+fn render_stats(f: &mut Frame, state: &AppState) {
+    let theme = &state.theme;
+    let truecolor = truecolor_enabled(state);
+    let area = f.area();
+    let samples = state.prof.samples();
+    // The header carries the per-tick totals; the aggregate `gpu` row is
+    // replaced by per-card rows so cost is attributable to a GPU.
+    let mut rows: Vec<(String, ProfStats)> = PROF_BLOCKS
+        .iter()
+        .filter(|b| {
+            !matches!(
+                **b,
+                ProfBlock::Total | ProfBlock::CpuTime | ProfBlock::Gpu
+            )
+        })
+        .map(|b| (b.label().to_string(), state.prof.stats(*b)))
+        .collect();
+    for i in 0..state.prof.gpu_count() {
+        rows.push((format!("gpu{}", i), state.prof.stats_gpu(i)));
+    }
+    // Hot blocks first; the per-tick total lives in the header line.
+    rows.sort_by(|a, b| b.1.avg_us.total_cmp(&a.1.avg_us));
+
+    let total = state.prof.stats(ProfBlock::Total);
+    let cpu = state.prof.stats(ProfBlock::CpuTime);
+    let median_us = state.prof.median(ProfBlock::Total);
+    // Process CPU time over the same window the process-accounting tools
+    // would use — this is the number that should match a %CPU column.
+    let core_pct = if samples > 0 {
+        cpu.avg_us / (state.refresh_secs.max(0.01) * 1.0e6) * 100.0
+    } else {
+        0.0
+    };
+
+    let popup_w = 76u16.min(area.width.saturating_sub(2));
+    let popup_h = (rows.len() as u16 + 8).min(area.height);
+    let popup = Rect::new(
+        area.x + (area.width - popup_w) / 2,
+        area.y + (area.height - popup_h) / 2,
+        popup_w,
+        popup_h,
+    );
+    Clear.render(popup, f.buffer_mut());
+    let block = styled_block("Performance", theme.bar_mid, truecolor);
+
+    let mut lines: Vec<Line> = Vec::new();
+    if samples == 0 {
+        lines.push(Line::from(Span::styled(
+            " collecting first tick...",
+            muted_style(state.steady_render, truecolor),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            format!(
+                " last {} ticks: cpu {}/tick = {:.2}% of one core @ {}s",
+                samples,
+                format_us(cpu.avg_us),
+                core_pct,
+                state.refresh_secs
+            ),
+            white_style(truecolor),
+        )));
+        lines.push(Line::from(Span::styled(
+            format!(
+                " wall median {} · avg {} · worst {} · rows are wall",
+                format_us(median_us),
+                format_us(total.avg_us),
+                format_us(total.max_us)
+            ),
+            muted_style(state.steady_render, truecolor),
+        )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("{:<14}{:>14}{:>14}{:>14}", "block", "last", "avg/tick", "max"),
+            muted_bold_style(state.steady_render, truecolor),
+        )));
+        for (b, s) in rows {
+            // A block eating more than half the tick is worth noticing.
+            let hot = total.avg_us > 0.0 && s.avg_us > 0.5 * total.avg_us;
+            let value_style = if hot {
+                Style::default()
+                    .fg(display_color(theme.bar_high, truecolor))
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                white_style(truecolor)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{:<14}", b),
+                    muted_style(state.steady_render, truecolor),
+                ),
+                Span::styled(format!("{:>14}", format_us(s.last_us)), value_style),
+                Span::styled(format!("{:>14}", format_us(s.avg_us)), value_style),
+                Span::styled(format!("{:>14}", format_us(s.max_us)), value_style),
+            ]));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        " s/Esc Close ",
+        muted_style(state.steady_render, truecolor),
+    )));
+
+    f.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
 // ── Theme picker ──

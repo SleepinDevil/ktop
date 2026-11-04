@@ -161,9 +161,34 @@ fn cached_power_limit(
 
 // ── NVIDIA via NVML ──
 
+/// NVML calls block in driver round-trips that take milliseconds each when
+/// the GPU is idle (asleep) — measuring showed the full per-tick query
+/// costing tens of milliseconds of wall time. Static per-device facts are
+/// fetched once (they do not change while the card runs) and slow-moving
+/// metrics (temperature, power, PCIe counters) are held for this long;
+/// utilization and VRAM — the only per-tick-meaningful values — refresh on
+/// every call.
+const NVML_SLOW_SECS: f64 = 3.0;
+
+#[derive(Clone, Default)]
+struct NvSlot {
+    // Statics: fetched once, then reused.
+    name: Option<String>,
+    power_limit_w: Option<f64>,
+    bdf: Option<String>,
+    slowdown_c: Option<f64>,
+    // Slow metrics: refetched when NVML_SLOW_SECS have passed, held between.
+    temp_c: Option<f64>,
+    power_w: Option<f64>,
+    pcie_rx_kbs: Option<f64>,
+    pcie_tx_kbs: Option<f64>,
+    last_slow: Option<Instant>,
+}
+
 pub struct NvidiaState {
     nvml: nvml_wrapper::Nvml,
     pub count: usize,
+    slots: Vec<NvSlot>,
 }
 
 impl NvidiaState {
@@ -181,93 +206,134 @@ impl NvidiaState {
         if count == 0 {
             return None;
         }
-        Some(Self { nvml, count })
+        Some(Self {
+            nvml,
+            count,
+            slots: vec![NvSlot::default(); count],
+        })
     }
 
-    pub fn sample(&self, base_id: usize) -> Vec<GpuInfo> {
+    pub fn sample(&mut self, base_id: usize) -> Vec<GpuInfo> {
+        use nvml_wrapper::enum_wrappers::device::{
+            PcieUtilCounter, TemperatureSensor, TemperatureThreshold,
+        };
         let mut gpus = Vec::new();
         for i in 0..self.count {
+            let due = self.slots[i]
+                .last_slow
+                .map_or(true, |t| t.elapsed().as_secs_f64() >= NVML_SLOW_SECS);
+            // NVML reads borrow self.nvml, so collect them into locals first;
+            // the cache write happens after the device borrow is gone.
+            let mut live = None;
+            let mut slow = None;
             if let Ok(dev) = self.nvml.device_by_index(i as u32) {
-                let name = dev.name().unwrap_or_else(|_| format!("GPU {}", i));
-                let util = dev
-                    .utilization_rates()
-                    .map(|u| u.gpu as f64)
-                    .unwrap_or(0.0);
-                let (mem_used, mem_total) = dev
-                    .memory_info()
-                    .map(|m| (m.used as f64, m.total as f64))
-                    .unwrap_or((0.0, 1.0));
-                let mem_pct = if mem_total > 0.0 {
-                    mem_used / mem_total * 100.0
-                } else {
-                    0.0
-                };
-                gpus.push(GpuInfo {
-                    id: base_id + i,
-                    name,
-                    util,
-                    has_util: true,
-                    mem_used_gb: mem_used / (1024.0 * 1024.0 * 1024.0),
-                    mem_total_gb: mem_total / (1024.0 * 1024.0 * 1024.0),
-                    mem_pct,
-                    has_mem: true,
-                    pci: dev
-                        .pci_info()
-                        .ok()
-                        .and_then(|p| read_pci_link(&normalize_bdf(&p.bus_id))),
-                    power_limit_w: dev
-                        .power_management_limit()
-                        .ok()
-                        .map(|mw| mw as f64 / 1000.0),
-                    pcie_rx_kbs: dev
-                        .pcie_throughput(nvml_wrapper::enum_wrappers::device::PcieUtilCounter::Receive)
-                        .ok()
-                        .map(|v| v as f64),
-                    pcie_tx_kbs: dev
-                        .pcie_throughput(nvml_wrapper::enum_wrappers::device::PcieUtilCounter::Send)
-                        .ok()
-                        .map(|v| v as f64),
-                });
+                live = Some((
+                    dev.utilization_rates()
+                        .map(|u| u.gpu as f64)
+                        .unwrap_or(0.0),
+                    dev.memory_info()
+                        .map(|m| (m.used as f64, m.total as f64))
+                        .unwrap_or((0.0, 1.0)),
+                ));
+                if due {
+                    slow = Some((
+                        dev.name().ok(),
+                        dev.power_management_limit()
+                            .ok()
+                            .map(|mw| mw as f64 / 1000.0),
+                        dev.pci_info().ok().map(|p| normalize_bdf(&p.bus_id)),
+                        dev.temperature_threshold(TemperatureThreshold::Slowdown)
+                            .ok()
+                            .map(|t| t as f64),
+                        dev.temperature(TemperatureSensor::Gpu)
+                            .ok()
+                            .map(|t| t as f64),
+                        dev.power_usage().ok().map(|mw| mw as f64 / 1000.0),
+                        dev.pcie_throughput(PcieUtilCounter::Receive)
+                            .ok()
+                            .map(|v| v as f64),
+                        dev.pcie_throughput(PcieUtilCounter::Send)
+                            .ok()
+                            .map(|v| v as f64),
+                    ));
+                }
             }
+            let Some((util, (mem_used, mem_total))) = live else {
+                continue;
+            };
+            let slot = &mut self.slots[i];
+            if let Some((name, limit, bdf, slow_c, temp, power, rx, tx)) = slow {
+                // Keep the last good value on a failed read — a transient
+                // error must blank nothing that was on screen.
+                if name.is_some() {
+                    slot.name = name;
+                }
+                if limit.is_some() {
+                    slot.power_limit_w = limit;
+                }
+                if bdf.is_some() {
+                    slot.bdf = bdf;
+                }
+                if slow_c.is_some() {
+                    slot.slowdown_c = slow_c;
+                }
+                if temp.is_some() {
+                    slot.temp_c = temp;
+                }
+                if power.is_some() {
+                    slot.power_w = power;
+                }
+                if rx.is_some() {
+                    slot.pcie_rx_kbs = rx;
+                }
+                if tx.is_some() {
+                    slot.pcie_tx_kbs = tx;
+                }
+                slot.last_slow = Some(Instant::now());
+            }
+            let mem_pct = if mem_total > 0.0 {
+                mem_used / mem_total * 100.0
+            } else {
+                0.0
+            };
+            gpus.push(GpuInfo {
+                id: base_id + i,
+                name: slot
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("GPU {}", i)),
+                util,
+                has_util: true,
+                mem_used_gb: mem_used / (1024.0 * 1024.0 * 1024.0),
+                mem_total_gb: mem_total / (1024.0 * 1024.0 * 1024.0),
+                mem_pct,
+                has_mem: true,
+                // sysfs link state is a cheap read and the negotiation
+                // really does change with power states, so it stays per-tick.
+                pci: slot.bdf.as_deref().and_then(read_pci_link),
+                power_limit_w: slot.power_limit_w,
+                pcie_rx_kbs: slot.pcie_rx_kbs,
+                pcie_tx_kbs: slot.pcie_tx_kbs,
+            });
         }
         gpus
     }
 
-    pub fn power_watts(&self) -> Vec<Option<f64>> {
-        let mut powers = Vec::new();
-        for i in 0..self.count {
-            let power = self
-                .nvml
-                .device_by_index(i as u32)
-                .ok()
-                .and_then(|dev| dev.power_usage().ok())
-                .map(|mw| mw as f64 / 1000.0);
-            powers.push(power);
-        }
-        powers
+    pub fn power_watts(&mut self) -> Vec<Option<f64>> {
+        // Served from the sample() cache; the NVML read rides the slow path.
+        self.slots.iter().map(|s| s.power_w).collect()
     }
 
-    pub fn temps(&self) -> Vec<Option<GpuTemp>> {
-        let mut temps = Vec::new();
-        for i in 0..self.count {
-            if let Ok(dev) = self.nvml.device_by_index(i as u32) {
-                let temp = dev
-                    .temperature(nvml_wrapper::enum_wrappers::device::TemperatureSensor::Gpu)
-                    .ok()
-                    .map(|t| t as f64);
-                let max = dev
-                    .temperature_threshold(
-                        nvml_wrapper::enum_wrappers::device::TemperatureThreshold::Slowdown,
-                    )
-                    .ok()
-                    .map(|t| t as f64)
-                    .unwrap_or(95.0);
-                temps.push(temp.map(|t| GpuTemp { temp: t, max }));
-            } else {
-                temps.push(None);
-            }
-        }
-        temps
+    pub fn temps(&mut self) -> Vec<Option<GpuTemp>> {
+        self.slots
+            .iter()
+            .map(|s| {
+                s.temp_c.map(|t| GpuTemp {
+                    temp: t,
+                    max: s.slowdown_c.unwrap_or(95.0),
+                })
+            })
+            .collect()
     }
 }
 
@@ -500,7 +566,10 @@ pub struct IntelCard {
     link_bdf: String,
     driver: String,
     l0: Option<L0>,
-    fd_prev: HashMap<String, (f64, u64)>,
+    fd_walk: FdWalk,
+    // Last fdinfo scan result (util%, VRAM KB) with its timestamp, held
+    // across ticks while fdinfo is the only util source (FDINFO_UTIL_HOLD_SECS).
+    fd_cache: Option<(Option<f64>, Option<u64>, Instant)>,
     power_limit_cache: std::cell::Cell<Option<Option<f64>>>,
 }
 
@@ -749,104 +818,170 @@ fn monotonic_ns() -> u64 {
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
+/// How long the set of DRM-client fds found by a full walk stays trusted:
+/// clients appear and vanish rarely (desktop processes hold one persistent
+/// fd), and re-discovering them costs a full `/proc/<pid>/fdinfo` scan —
+/// thousands of opens on a desktop. After this interval the next walk is a
+/// full one again, picking up clients that started in the meantime.
+const FDINFO_FULL_WALK_SECS: f64 = 15.0;
+/// While the PMU is unavailable fdinfo is the only util source, and engine
+/// cycles drift far slower than a refresh tick, so the last scan result is
+/// held for this interval instead of re-walking (and re-opening) every tick.
+const FDINFO_UTIL_HOLD_SECS: f64 = 5.0;
+
+/// Walk state shared across samples: the previous per-client engine-cycle
+/// sample plus the `/proc/<pid>/fdinfo/<fd>` entries that identified this
+/// card's DRM clients on the last walk. Incremental walks re-read only that
+/// set — an fd that no longer reads or no longer matches (client exited) is
+/// dropped — so a steady system costs one open per client fd instead of one
+/// per procfs fd in the whole machine.
+#[derive(Clone, Debug, Default)]
+struct FdWalk {
+    /// Previous sample's per-client engine cycles, keyed by DRM client id;
+    /// utilization is delta-based (the absolute counters are monotonic per
+    /// open; the PMU source is preferred when available — real engine time,
+    /// no fd churn).
+    prev: HashMap<String, (f64, u64)>,
+    known: Vec<(u32, String)>,
+    last_full: Option<Instant>,
+}
+
+/// Read one fdinfo file; if it describes a DRM client on `driver`/`bdf`,
+/// fold its engine cycles into `cur` and its active VRAM into `sum_vram`,
+/// and return true — which registers the fd in the incremental walk set.
+fn scan_client_fd(
+    path: &std::path::Path,
+    driver: &str,
+    bdf: &str,
+    cur: &mut HashMap<String, (f64, u64)>,
+    sum_vram: &mut u64,
+    saw_vram: &mut bool,
+) -> bool {
+    let text = match fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    if !text.contains("drm-driver:") {
+        return false;
+    }
+    let mut kv: HashMap<&str, &str> = HashMap::new();
+    for line in text.lines() {
+        if let Some((k, v)) = line.split_once(':') {
+            // fdinfo keys never contain ':', first split wins.
+            kv.entry(k.trim_end()).or_insert(v.trim());
+        }
+    }
+    if kv.get("drm-driver").map(|v| v.trim()) != Some(driver)
+        || kv.get("drm-pdev").map(|v| v.trim()) != Some(bdf)
+    {
+        return false;
+    }
+    let cid = kv
+        .get("drm-client-id")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let busy = if driver == "i915" {
+        ["drm-engine-render", "drm-engine-compute"]
+            .iter()
+            .map(|k| {
+                kv.get(*k)
+                    .and_then(|v| v.trim_end_matches(" ns").trim().parse::<f64>().ok())
+                    .unwrap_or(0.0)
+            })
+            .sum()
+    } else {
+        ["drm-cycles-rcs", "drm-cycles-ccs"]
+            .iter()
+            .map(|k| {
+                let c = kv
+                    .get(*k)
+                    .and_then(|v| v.trim().parse::<f64>().ok())
+                    .unwrap_or(0.0);
+                let cap = kv
+                    .get(format!("drm-engine-capacity-{}", k.trim_start_matches("drm-cycles-")).as_str())
+                    .and_then(|v| v.trim().parse::<f64>().ok())
+                    .filter(|v| *v > 0.0)
+                    .unwrap_or(1.0);
+                c / cap
+            })
+            .sum()
+    };
+    let total = if driver == "i915" {
+        monotonic_ns()
+    } else {
+        kv.get("drm-total-cycles-ccs")
+            .or_else(|| kv.get("drm-total-cycles-rcs"))
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    if !cid.is_empty() && (busy > 0.0 || total > 0) {
+        cur.insert(cid, (busy, total));
+    }
+    if let Some(v) = kv.get("drm-active-vram0").and_then(|v| parse_size_kb(v)) {
+        *sum_vram += v;
+        *saw_vram = true;
+    }
+    true
+}
+
+/// Collect this card's DRM clients. `full` walks every `/proc/<pid>/fdinfo`
+/// to discover them; otherwise only the fds of the previous walk are
+/// re-read (see `FdWalk`). The return values and the delta semantics are
+/// identical either way:
+/// max per-engine busy% = ΣΔbusy / Δcycles across clients, VRAM = Σ active-vram0.
 fn fdinfo_scan(
     proc_root: &std::path::Path,
     driver: &str,
     bdf: &str,
-    prev: &mut HashMap<String, (f64, u64)>,
+    walk: &mut FdWalk,
+    full: bool,
 ) -> (Option<f64>, Option<u64>) {
     // The xe/i915 drivers expose per-DRM-client engine cycles and VRAM in
-    // /proc/<pid>/fdinfo, readable for the user's own processes. Utilization
-    // = Δbusy cycles / Δtotal cycles across clients; VRAM used = Σ active-vram0.
+    // /proc/<pid>/fdinfo, readable for the user's own processes.
     if bdf.is_empty() {
         return (None, None);
     }
     let mut cur: HashMap<String, (f64, u64)> = HashMap::new();
     let mut sum_vram = 0u64;
     let mut saw_vram = false;
-    let pids = match fs::read_dir(proc_root) {
-        Ok(r) => r,
-        Err(_) => return (None, None),
-    };
-    for pid in pids.flatten() {
-        let name = pid.file_name().to_string_lossy().to_string();
-        if name.is_empty() || !name.bytes().all(|c| c.is_ascii_digit()) {
-            continue;
-        }
-        let fds = match fs::read_dir(pid.path().join("fdinfo")) {
+    let mut next_known: Vec<(u32, String)> = Vec::new();
+    if full {
+        let pids = match fs::read_dir(proc_root) {
             Ok(r) => r,
-            Err(_) => continue,
+            Err(_) => return (None, None),
         };
-        for fd in fds.flatten() {
-            let text = match fs::read_to_string(fd.path()) {
-                Ok(t) => t,
+        for pid in pids.flatten() {
+            let name = pid.file_name().to_string_lossy().to_string();
+            let Ok(pid_num) = name.parse::<u32>() else {
+                continue;
+            };
+            let fds = match fs::read_dir(pid.path().join("fdinfo")) {
+                Ok(r) => r,
                 Err(_) => continue,
             };
-            if !text.contains("drm-driver:") {
-                continue;
-            }
-            let mut kv: HashMap<&str, &str> = HashMap::new();
-            for line in text.lines() {
-                if let Some((k, v)) = line.split_once(':') {
-                    kv.entry(k.trim_end()).or_insert(v.trim());
+            for fd in fds.flatten() {
+                let fd_name = fd.file_name().to_string_lossy().to_string();
+                if scan_client_fd(&fd.path(), driver, bdf, &mut cur, &mut sum_vram, &mut saw_vram) {
+                    next_known.push((pid_num, fd_name));
                 }
             }
-            if kv.get("drm-driver").map(|v| v.trim()) != Some(driver)
-                || kv.get("drm-pdev").map(|v| v.trim()) != Some(bdf)
-            {
-                continue;
-            }
-            let cid = kv
-                .get("drm-client-id")
-                .map(|s| s.trim().to_string())
-                .unwrap_or_default();
-            let busy = if driver == "i915" {
-                ["drm-engine-render", "drm-engine-compute"]
-                    .iter()
-                    .map(|k| {
-                        kv.get(*k)
-                            .and_then(|v| v.trim_end_matches(" ns").trim().parse::<f64>().ok())
-                            .unwrap_or(0.0)
-                    })
-                    .sum()
-            } else {
-                ["drm-cycles-rcs", "drm-cycles-ccs"]
-                    .iter()
-                    .map(|k| {
-                        let c = kv
-                            .get(*k)
-                            .and_then(|v| v.trim().parse::<f64>().ok())
-                            .unwrap_or(0.0);
-                        let cap = kv
-                            .get(format!("drm-engine-capacity-{}", k.trim_start_matches("drm-cycles-")).as_str())
-                            .and_then(|v| v.trim().parse::<f64>().ok())
-                            .filter(|v| *v > 0.0)
-                            .unwrap_or(1.0);
-                        c / cap
-                    })
-                    .sum()
-            };
-            let total = if driver == "i915" {
-                monotonic_ns()
-            } else {
-                kv.get("drm-total-cycles-ccs")
-                    .or_else(|| kv.get("drm-total-cycles-rcs"))
-                    .and_then(|v| v.trim().parse::<u64>().ok())
-                    .unwrap_or(0)
-            };
-            if !cid.is_empty() && (busy > 0.0 || total > 0) {
-                cur.insert(cid, (busy, total));
-            }
-            if let Some(v) = kv.get("drm-active-vram0").and_then(|v| parse_size_kb(v)) {
-                sum_vram += v;
-                saw_vram = true;
+        }
+    } else {
+        for (pid_num, fd_name) in walk.known.iter() {
+            let path = proc_root
+                .join(pid_num.to_string())
+                .join("fdinfo")
+                .join(fd_name);
+            if scan_client_fd(&path, driver, bdf, &mut cur, &mut sum_vram, &mut saw_vram) {
+                next_known.push((*pid_num, fd_name.clone()));
             }
         }
     }
+    walk.known = next_known;
     let mut max_span = 0u64;
     let mut used = 0f64;
     for (cid, (b, t)) in &cur {
-        if let Some((pb, pt)) = prev.get(cid) {
+        if let Some((pb, pt)) = walk.prev.get(cid) {
             if t > pt {
                 max_span = max_span.max(t - pt);
             }
@@ -860,7 +995,7 @@ fn fdinfo_scan(
     } else {
         None
     };
-    *prev = cur;
+    walk.prev = cur;
     (util, if saw_vram { Some(sum_vram) } else { None })
 }
 
@@ -1102,7 +1237,8 @@ fn detect_intel_gpus_in(sys_root: &std::path::Path, l0_enabled: bool) -> Vec<Int
             link_bdf,
             driver,
             l0,
-            fd_prev: HashMap::new(),
+            fd_walk: FdWalk::default(),
+            fd_cache: None,
             power_limit_cache: std::cell::Cell::new(None),
         });
     }
@@ -1118,20 +1254,33 @@ impl IntelCard {
             .as_ref()
             .and_then(|p| read_u64(p))
             .filter(|_| l0_mem.is_none());
-        // The fdinfo walk touches every /proc/<pid>/fdinfo on the box, so it
-        // runs only when its answers are actually needed: utilization when
-        // the PMU is unavailable, and VRAM when neither Level Zero nor sysfs
-        // exposes it. With both covered the scan result would be discarded.
-        let (fd_util, fd_vram) = if pmu_util.is_some() && (l0_mem.is_some() || sysfs_vram.is_some())
-        {
-            (None, None)
+        // The fdinfo walk supplies only what nothing else covers: utilization
+        // when the PMU is unavailable, and VRAM when neither Level Zero nor
+        // sysfs exposes it. With both covered the scan result would be
+        // discarded. While fdinfo is the sole util source its result is held
+        // for FDINFO_UTIL_HOLD_SECS — engine cycles drift far slower than a
+        // tick, so re-walking every tick buys nothing (a cached VRAM figure
+        // ages with the same window; a dedicated VRAM-only need re-walks
+        // every tick). The walk itself re-reads only the known client fds
+        // except on periodic full rediscovery (see FdWalk).
+        let need_util = pmu_util.is_none();
+        let need_vram = l0_mem.is_none() && sysfs_vram.is_none();
+        let (fd_util, fd_vram) = if need_util || need_vram {
+            let hold = if need_util {
+                FDINFO_UTIL_HOLD_SECS
+            } else {
+                0.0
+            };
+            match &self.fd_cache {
+                Some((u, v, at)) if at.elapsed().as_secs_f64() < hold => (*u, *v),
+                _ => {
+                    let r = self.walk_fdinfo();
+                    self.fd_cache = Some((r.0, r.1, Instant::now()));
+                    r
+                }
+            }
         } else {
-            fdinfo_scan(
-                std::path::Path::new("/proc"),
-                &self.driver,
-                &self.bdf,
-                &mut self.fd_prev,
-            )
+            (None, None)
         };
         let util = pmu_util.or(fd_util);
         let mem_used_bytes: Option<u64> = l0_mem
@@ -1166,15 +1315,45 @@ impl IntelCard {
         }
     }
 
+    /// Run an fdinfo walk, re-discovering the DRM client set only when the
+    /// last full walk has aged out or nothing is known (first walk, or all
+    /// clients gone — then there is no cheaper option anyway).
+    fn walk_fdinfo(&mut self) -> (Option<f64>, Option<u64>) {
+        let full = self
+            .fd_walk
+            .last_full
+            .map_or(true, |at| at.elapsed().as_secs_f64() >= FDINFO_FULL_WALK_SECS)
+            || self.fd_walk.known.is_empty();
+        if full {
+            self.fd_walk.last_full = Some(Instant::now());
+        }
+        fdinfo_scan(
+            std::path::Path::new("/proc"),
+            &self.driver,
+            &self.bdf,
+            &mut self.fd_walk,
+            full,
+        )
+    }
+
     pub fn util_pct(&mut self) -> Option<f64> {
         // Intel exposes no sysfs utilization counter; the xe PMU provides
         // engine-active-ticks (0x02) / engine-total-ticks (0x03) with
         // engine_instance at config bits 12-19 and engine_class at 20-27
         // (render class 0, instance 0). Requires perf_event_paranoid <= 0;
-        // when the open is denied, utilization stays n/a.
+        // a denied open (EACCES at the default paranoid level) is permanent
+        // for the process: retrying every tick would burn two syscalls per
+        // tick for a result that cannot change, and the fdinfo fallback
+        // covers utilization meanwhile.
         let pmu_type = self.pmu_type?;
         if self.active_fd < 0 {
-            let active = open_pmu_counter(pmu_type, 0x02, -1)?;
+            let active = match open_pmu_counter(pmu_type, 0x02, -1) {
+                Some(fd) => fd,
+                None => {
+                    self.pmu_type = None;
+                    return None;
+                }
+            };
             match open_pmu_counter(pmu_type, 0x03, active) {
                 Some(total) => {
                     self.active_fd = active;
@@ -1396,10 +1575,16 @@ mod tests {
              drm-cycles-rcs:\t0\ndrm-total-cycles-rcs:\t1000\n\
              drm-cycles-ccs:\t500\ndrm-engine-capacity-ccs:\t2\ndrm-total-cycles-ccs:\t1000\n",
         );
-        let mut prev = HashMap::new();
-        let (u1, v1) = fdinfo_scan(&root, "xe", "0000:99:00.0", &mut prev);
+        let mut walk = FdWalk::default();
+        let (u1, v1) = fdinfo_scan(&root, "xe", "0000:99:00.0", &mut walk, true);
         assert_eq!(u1, Some(0.0)); // first scan: client visible, no delta yet
         assert_eq!(v1, Some(33059392 * 1024));
+        // The full walk registers the client fd for incremental re-reads.
+        assert_eq!(
+            walk.known,
+            vec![(1234u32, "3".to_string())],
+            "full walk must record the matching fd"
+        );
         write_file(
             &fd.join("3"),
             "pos:\t0\nflags:\t02100002\n\
@@ -1408,10 +1593,47 @@ mod tests {
              drm-cycles-rcs:\t0\ndrm-total-cycles-rcs:\t2000\n\
              drm-cycles-ccs:\t1500\ndrm-engine-capacity-ccs:\t2\ndrm-total-cycles-ccs:\t2000\n",
         );
-        let (u2, v2) = fdinfo_scan(&root, "xe", "0000:99:00.0", &mut prev);
+        // Incremental walk (only the known fd is re-read) yields the same
+        // delta-based values.
+        let (u2, v2) = fdinfo_scan(&root, "xe", "0000:99:00.0", &mut walk, false);
         // Δbusy = (1500-500)/2 = 500, Δtotal = 1000 → 50%
         assert!((u2.unwrap() - 50.0).abs() < 1e-6);
         assert_eq!(v2, Some(33059392 * 1024));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn client_fd_churn_drops_known_fds_and_a_full_walk_rediscovers_them() {
+        let root = std::env::temp_dir().join(format!("ktop_fdinfo_churn_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let fd = root.join("1234/fdinfo");
+        let content = "drm-driver:\txe\ndrm-client-id:\t7\ndrm-pdev:\t0000:99:00.0\n\
+             drm-active-vram0:\t1024 KiB\n\
+             drm-cycles-rcs:\t0\ndrm-total-cycles-rcs:\t1000\n";
+        write_file(&fd.join("3"), content);
+        let mut walk = FdWalk::default();
+        let (u, v) = fdinfo_scan(&root, "xe", "0000:99:00.0", &mut walk, true);
+        assert!(u.is_some());
+        assert_eq!(v, Some(1024 * 1024));
+        assert_eq!(walk.known.len(), 1);
+
+        // The client exits: its fd is gone, and the incremental walk drops
+        // it without touching the rest of /proc — no clients left, no data.
+        fs::remove_file(fd.join("3")).unwrap();
+        let (u, v) = fdinfo_scan(&root, "xe", "0000:99:00.0", &mut walk, false);
+        assert_eq!(u, None);
+        assert_eq!(v, None);
+        assert!(walk.known.is_empty(), "stale fd must be dropped from the set");
+
+        // A new client opens (fd number reused): only a full walk sees it —
+        // the empty known set makes that the caller's decision (walk_fdinfo).
+        write_file(&root.join("4321/fdinfo/3"), content);
+        let (u, _) = fdinfo_scan(&root, "xe", "0000:99:00.0", &mut walk, false);
+        assert_eq!(u, None, "incremental walk must not see unlisted clients");
+        let (u, v) = fdinfo_scan(&root, "xe", "0000:99:00.0", &mut walk, true);
+        assert!(u.is_some());
+        assert_eq!(v, Some(1024 * 1024));
+        assert_eq!(walk.known, vec![(4321u32, "3".to_string())]);
         let _ = fs::remove_dir_all(&root);
     }
 

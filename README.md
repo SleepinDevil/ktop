@@ -101,6 +101,7 @@ ktop uninstall
 |-----|--------|
 | `q` / `ESC` | Quit |
 | `t` | Open theme picker |
+| `s` | Performance stats page: per-block timing of the refresh loop and ktop's own CPU time; `s`/`Esc` closes |
 | `c` | Toggle color mode between truecolor and safe Basic color output |
 | Arrow keys | Navigate theme picker |
 | `Enter` | Select theme |
