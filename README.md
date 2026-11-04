@@ -6,7 +6,7 @@ A terminal-based system resource monitor built for tracking resource usage when 
 
 ## About this fork
 
-This is **SleepinDevil's fork** of [brontoguana/ktop](https://github.com/brontoguana/ktop). Everything from upstream is here; on top of it:
+This is a fork of [brontoguana/ktop](https://github.com/brontoguana/ktop). Everything from upstream is here; on top of it:
 
 - **Significant performance improvements** — the upstream application uses roughly 6% of a single core while idle; this fork uses roughly 0.8% at the same refresh rate, by sampling only what changes: one `/proc` read per panel, cached sysfs/hwmon paths, fdinfo/NVML query caching, and a poll-based event loop
 - **Intel GPU support** — detection and full per-GPU panels for Intel Arc cards (`xe`/`i915`): utilization, VRAM, temperature, and power, no root required
