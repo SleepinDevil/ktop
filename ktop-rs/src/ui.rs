@@ -1365,14 +1365,18 @@ fn render_status_bar(f: &mut Frame, area: Rect, state: &AppState) {
     } else {
         "░ No OOM kills".to_string()
     };
-    // Verified-newer-release notice: a separate right-hand segment ahead of
-    // PWR, separated from it by a vertical bar. Absent until (and unless)
-    // the background check confirms a newer release. The styled spans below
-    // must reproduce `update_text` exactly — it sizes the segment.
-    let update_text = if state.update_available {
-        format!("v{} | Update available │ ", env!("CARGO_PKG_VERSION"))
-    } else {
-        String::new()
+    // Version stamp on the right, before PWR, separated by a vertical bar —
+    // always visible. Once (and only if) the background check confirms a
+    // newer release, `| Update available ` pops in between the version and
+    // the separator. The styled spans below must reproduce `update_text`
+    // exactly — it sizes the segment.
+    let update_text = {
+        let mut text = format!("v{} ", env!("CARGO_PKG_VERSION"));
+        if state.update_available {
+            text.push_str("| Update available ");
+        }
+        text.push_str("│ ");
+        text
     };
     let right_len = power_text.len() + oom_text.len() + update_text.len();
     let right_width = right_len.min(area.width as usize) as u16;
@@ -1383,15 +1387,14 @@ fn render_status_bar(f: &mut Frame, area: Rect, state: &AppState) {
 
     f.render_widget(Paragraph::new(Line::from(left_spans)), chunks[0]);
 
-    // Verified-newer-release notice: a separate right-hand segment ahead of
-    // PWR, separated from it by a vertical bar. Absent until (and unless)
-    // the background check confirms a newer release.
+    // Version stamp always visible ahead of PWR; the flag spans appear only
+    // once the background check confirmed a newer release.
     let mut right_spans = Vec::new();
+    right_spans.push(Span::styled(
+        format!("v{} ", env!("CARGO_PKG_VERSION")),
+        muted_style(state.steady_render, truecolor),
+    ));
     if state.update_available {
-        right_spans.push(Span::styled(
-            format!("v{} ", env!("CARGO_PKG_VERSION")),
-            muted_style(state.steady_render, truecolor),
-        ));
         right_spans.push(Span::styled(
             "| ",
             muted_style(state.steady_render, truecolor),
@@ -1402,11 +1405,11 @@ fn render_status_bar(f: &mut Frame, area: Rect, state: &AppState) {
                 .fg(display_color(theme.bar_high, truecolor))
                 .add_modifier(Modifier::BOLD),
         ));
-        right_spans.push(Span::styled(
-            "│ ",
-            muted_style(state.steady_render, truecolor),
-        ));
     }
+    right_spans.push(Span::styled(
+        "│ ",
+        muted_style(state.steady_render, truecolor),
+    ));
     match state.est_power_watts {
         Some(power) => right_spans.push(Span::styled(
             format!("PWR ~{}W  ", power.round() as u64),

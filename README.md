@@ -27,6 +27,7 @@ This is **SleepinDevil's fork** of [brontoguana/ktop](https://github.com/brontog
 - **Disks panel** — live per-device Read/Write throughput for physical disks, NVMe first
 - **Per-core CPU grid** — braille per-core usage heat-grid with core-count, total %, frequency, and package-power readouts
 - **Deeper memory panel** — PSI memory pressure, committed vs commit-limit, and swap I/O throughput
+- **Status-bar version stamp** — bottom right always shows the running version; a background release check pops `| Update available` into it when the fork has a newer release (disable with `--no-update-check` or `KTOP_NO_UPDATE_CHECK=1`)
 - One-line install and upgrade: `curl -sSfL https://raw.githubusercontent.com/SleepinDevil/ktop/master/install.sh | bash`
 - No runtime dependencies — no Python, no pip, no venv
 

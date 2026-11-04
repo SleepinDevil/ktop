@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.28 — 2026-11-04
+- Status bar: the version stamp `v<current> │ ` is now ALWAYS shown bottom-right before PWR; `| Update available ` still pops in between the version and the separator only when the background release check confirms a newer version (1.0.27 showed the whole segment only in that confirmed-newer case, so the running version was invisible while up to date)
+- Installer: `Installed:` printed raw `ktop -v` output (`ktop 1.0.27`) while `Latest:` printed the raw tag (`v1.0.27`); both now display normalized `vX.Y.Z`, as does the final installed message
+  - Tested: `cargo test` (35 tests), `cargo build --release`, PTY captures (160×50: `v1.0.28 │ PWR …` rendered with no flag on the current build, `v0.0.1 | Update available │ PWR …` from a downgraded build of the same code, version stamp still present with `--no-update-check`), `bash install.sh` run against the live releases showing matching `Installed: v…` / `Latest: v…` lines
+
 ## 1.0.27 — 2026-11-04
 - Startup update check: ktop now asks the fork's GitHub `releases/latest` endpoint once, on a detached background thread (`curl` subprocess — no HTTP crate), whether a release newer than the compiled-in version exists. The event loop picks the result up with a non-blocking read on the next tick, so startup and the sampling loop are untouched (idle cost unchanged); when a newer release is confirmed the status bar grows a right-hand segment `v<current> | Update available │ ` before the PWR readout — muted version, bold accented flag, vertical-bar separator — and nothing is ever shown while offline, on any check failure, or with the new `--no-update-check` / `KTOP_NO_UPDATE_CHECK=1`
 - Memory panel: `committed` label shortened to `comitd` to keep the Committed_AS/CommitLimit line inside narrow terminals

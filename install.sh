@@ -42,13 +42,14 @@ fi
 ASSET_NAME="ktop-${TARGET}"
 DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${LATEST}/${ASSET_NAME}"
 
-# Check existing version
-EXISTING_VERSION=""
+# Check existing version. `ktop -v` prints "ktop X.Y.Z" and the tag is
+# "vX.Y.Z" — normalize both displays to vX.Y.Z.
 if command -v "$BINARY_NAME" &>/dev/null; then
-    EXISTING_VERSION=$("$BINARY_NAME" -v 2>/dev/null || true)
-    echo "Installed: ${EXISTING_VERSION:-unknown version}"
+    INSTALLED_V=$("$BINARY_NAME" -v 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)+' | head -1 || true)
+    INSTALLED_V="${INSTALLED_V:+v$INSTALLED_V}"
+    echo "Installed: ${INSTALLED_V:-unknown version}"
 fi
-echo "Latest:    ${LATEST}"
+echo "Latest:    v${LATEST#v}"
 
 # Download to temp file
 TMPFILE=$(mktemp)
@@ -76,7 +77,7 @@ else
 fi
 
 echo ""
-echo "ktop ${LATEST} installed to ${INSTALL_DIR}/${BINARY_NAME}"
+echo "ktop v${LATEST#v} installed to ${INSTALL_DIR}/${BINARY_NAME}"
 
 # Check for stale installs that might shadow the new binary
 WHICH_KTOP=$(command -v ktop 2>/dev/null || true)
