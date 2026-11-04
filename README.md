@@ -4,6 +4,18 @@
 
 A terminal-based system resource monitor built for tracking resource usage when running hybrid LLM workloads.
 
+## About this fork
+
+This is **SleepinDevil's fork** of [brontoguana/ktop](https://github.com/brontoguana/ktop). Everything from upstream is here; on top of it:
+
+- **Significant performance improvements** — the upstream application uses roughly 6% of a single core while idle; this fork uses roughly 0.8% at the same refresh rate, by sampling only what changes: one `/proc` read per panel, cached sysfs/hwmon paths, fdinfo/NVML query caching, and a poll-based event loop
+- **Intel GPU support** — detection and full per-GPU panels for Intel Arc cards (`xe`/`i915`): utilization, VRAM, temperature, and power, no root required
+- **Revamped Network and Memory panels** — more detail (per-direction peak speeds, PSI memory pressure, committed vs commit-limit, swap I/O) with the three mid-row panel heights balanced so the layout sits evenly
+- **Grid activation core animation** — a per-core braille heat grid that automatically sizes itself up to 32 cores; with more cores than that it pairs them up for the UI, supporting up to 64 cores in the graphic
+- **Disks panel** — live per-device read/write throughput (great for projects like XeStrata doing their thing with disk reads)
+- **Performance stats page** (`s`) — per-block and per-GPU timing of the sampling loop, which is how we found that the NVIDIA software stack is on average far slower to answer info queries than the other vendors' — and made it 4× cheaper
+- **Process lists as the vertical height adjuster** — the Top Processes panels absorb or shrink for all vertical slack first, so GPU, CPU/memory/network, temperature, and disk panels keep their exact sizes at any terminal height
+
 ![Linux](https://img.shields.io/badge/platform-linux-blue)
 
 ## Features
@@ -15,7 +27,7 @@ A terminal-based system resource monitor built for tracking resource usage when 
 - **Disks panel** — live per-device Read/Write throughput for physical disks, NVMe first
 - **Per-core CPU grid** — braille per-core usage heat-grid with core-count, total %, frequency, and package-power readouts
 - **Deeper memory panel** — PSI memory pressure, committed vs commit-limit, and swap I/O throughput
-- One-line install and upgrade: `curl -sSfL https://raw.githubusercontent.com/brontoguana/ktop/master/install.sh | bash`
+- One-line install and upgrade: `curl -sSfL https://raw.githubusercontent.com/SleepinDevil/ktop/master/install.sh | bash`
 - No runtime dependencies — no Python, no pip, no venv
 
 ### Core
@@ -37,7 +49,7 @@ A terminal-based system resource monitor built for tracking resource usage when 
 ## Install
 
 ```bash
-curl -sSfL https://raw.githubusercontent.com/brontoguana/ktop/master/install.sh | bash
+curl -sSfL https://raw.githubusercontent.com/SleepinDevil/ktop/master/install.sh | bash
 ```
 
 Downloads the latest binary and installs it to `/usr/local/bin` (will prompt for sudo if needed). Run the same command again to upgrade.
@@ -57,7 +69,7 @@ ktop uninstall
 ### Build from source
 
 ```bash
-git clone https://github.com/brontoguana/ktop.git
+git clone https://github.com/SleepinDevil/ktop.git
 cd ktop/ktop-rs
 cargo build --release
 sudo cp target/release/ktop /usr/local/bin/

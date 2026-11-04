@@ -72,7 +72,7 @@ cp target/release/ktop ~/.local/bin/ktop   # install locally (per CLAUDE.md)
 - Rust stable, edition 2021; no pinned toolchain file.
 - Linux-only: requires `/proc`, `/sys/class/hwmon`, `/sys/class/powercap`, `/sys/class/drm`, `journalctl`; optional NVIDIA (NVML) / AMD GPUs.
 - CI builds via `cross` in older-glibc Docker containers for portability; targets are gnu triples only.
-- Install/update path: `curl -sSfL https://raw.githubusercontent.com/brontoguana/ktop/master/install.sh | bash` (same command upgrades; `ktop update` re-runs it; `ktop uninstall` removes only the resolved binary).
+- Install/update path: `curl -sSfL https://raw.githubusercontent.com/SleepinDevil/ktop/master/install.sh | bash` (same command upgrades; `ktop update` re-runs it; `ktop uninstall` removes only the resolved binary). Releases are cut by pushing a `v*` tag to `SleepinDevil/ktop` (origin); `brontoguana/ktop` is `upstream` only.
 
 ## Testing & QA
 

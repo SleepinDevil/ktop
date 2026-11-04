@@ -29,7 +29,7 @@ const COMPAT_REFRESH_SECS: f64 = 2.0;
 const DIAGNOSTIC_DURATION_SECS: f64 = 5.0;
 const RENDER_DIAGNOSTIC_DURATION_SECS: f64 = 4.0;
 const INSTALL_SCRIPT_URL: &str =
-    "https://raw.githubusercontent.com/brontoguana/ktop/master/install.sh";
+    "https://raw.githubusercontent.com/SleepinDevil/ktop/master/install.sh";
 
 fn main() {
     let mut refresh = 1.0f64;

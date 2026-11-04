@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # ktop installer — downloads the latest release binary from GitHub
 # Usage:
-#   curl -sSfL https://raw.githubusercontent.com/brontoguana/ktop/master/install.sh | bash
+#   curl -sSfL https://raw.githubusercontent.com/SleepinDevil/ktop/master/install.sh | bash
 set -euo pipefail
 
-REPO="brontoguana/ktop"
+REPO="SleepinDevil/ktop"
 INSTALL_DIR="/usr/local/bin"
 BINARY_NAME="ktop"
 
