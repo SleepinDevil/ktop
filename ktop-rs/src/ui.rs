@@ -1358,12 +1358,13 @@ fn render_status_bar(f: &mut Frame, area: Rect, state: &AppState) {
         Some(power) => format!("PWR ~{}W  ", power.round() as u64),
         None => "PWR n/a  ".to_string(),
     };
+    // OOM segment separated from PWR with the same vertical bar used for
+    // the other status segments; active vs none is carried by color, not
+    // by a leading block glyph.
     let oom_text = if let Some(ref oom) = state.oom_str {
-        format!("█ OOM Kill: {}", oom)
-    } else if state.steady_render {
-        "  No OOM kills".to_string()
+        format!("│ OOM Kill: {}", oom)
     } else {
-        "░ No OOM kills".to_string()
+        "│ No OOM kills".to_string()
     };
     // Version stamp on the right, before PWR, separated by a vertical bar —
     // always visible. Once (and only if) the background check confirms a

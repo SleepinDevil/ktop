@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.29 — 2026-11-04
+- Status bar: the leading block glyphs before the OOM segment (`█`/`░`) are replaced with the same `│` separator used between the other status segments, so the row reads `v<version> │ PWR ~…W  │ No OOM kills` consistently; active-kill vs none is carried entirely by color (bold accent vs muted)
+- Installer: `Installed:` used `command -v ktop` — whatever PATH resolved FIRST — so it happily reported a stale local copy (e.g. `~/.local/bin/ktop`) instead of the binary being replaced. It now reports the actual install target `$INSTALL_DIR/ktop` version with its path, prints `none in <dir>` when absent, and names any PATH-shadowing binary on a separate `On PATH:` line with its path and version
+  - Tested: `cargo test` (35 tests), `cargo build --release`, PTY capture of the new status row (`v1.0.29 │ PWR ~…W  │ No OOM kills`, no `█`/`░` anywhere), installer report block run verbatim against the live system (correctly showed `/usr/local/bin/ktop v1.0.28` as Installed and the `~/.local/bin` copy as the shadow)
+
 ## 1.0.28 — 2026-11-04
 - Status bar: the version stamp `v<current> │ ` is now ALWAYS shown bottom-right before PWR; `| Update available ` still pops in between the version and the separator only when the background release check confirms a newer version (1.0.27 showed the whole segment only in that confirmed-newer case, so the running version was invisible while up to date)
 - Installer: `Installed:` printed raw `ktop -v` output (`ktop 1.0.27`) while `Latest:` printed the raw tag (`v1.0.27`); both now display normalized `vX.Y.Z`, as does the final installed message

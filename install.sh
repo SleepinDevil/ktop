@@ -42,14 +42,25 @@ fi
 ASSET_NAME="ktop-${TARGET}"
 DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${LATEST}/${ASSET_NAME}"
 
-# Check existing version. `ktop -v` prints "ktop X.Y.Z" and the tag is
-# "vX.Y.Z" — normalize both displays to vX.Y.Z.
-if command -v "$BINARY_NAME" &>/dev/null; then
-    INSTALLED_V=$("$BINARY_NAME" -v 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)+' | head -1 || true)
-    INSTALLED_V="${INSTALLED_V:+v$INSTALLED_V}"
-    echo "Installed: ${INSTALLED_V:-unknown version}"
+# Report the version of the binary about to be replaced (the install dir —
+# not whatever PATH happens to resolve first, which may be a stale local
+# copy), and call out a shadowing binary separately.
+fmt_version() {
+    local raw
+    raw=$("$1" -v 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)+' | head -1 || true)
+    printf '%s' "${raw:+v$raw}"
+}
+if [ -x "$INSTALL_DIR/$BINARY_NAME" ]; then
+    TARGET_V=$(fmt_version "$INSTALL_DIR/$BINARY_NAME")
+    echo "Installed:  ${TARGET_V:-unknown version}  ($INSTALL_DIR/$BINARY_NAME)"
+else
+    echo "Installed:  none in $INSTALL_DIR"
 fi
-echo "Latest:    v${LATEST#v}"
+WHICH_KTOP=$(command -v "$BINARY_NAME" 2>/dev/null || true)
+if [ -n "$WHICH_KTOP" ] && [ "$WHICH_KTOP" != "$INSTALL_DIR/$BINARY_NAME" ]; then
+    echo "On PATH:    $(fmt_version "$WHICH_KTOP")  ($WHICH_KTOP) — shadows the installed binary"
+fi
+echo "Latest:     v${LATEST#v}"
 
 # Download to temp file
 TMPFILE=$(mktemp)
